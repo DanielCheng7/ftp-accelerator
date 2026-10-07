@@ -1,0 +1,877 @@
+# -*- coding: utf-8 -*-
+"""
+FTP 加速下载器 (FTP Accelerator)
+
+面向科研数据（如国家青藏高原科学数据中心 TPDC）的 FTP 多线程分段下载工具。
+内置 aria2 引擎，图形界面：连接 FTP -> 浏览远程目录 -> 勾选文件 -> 多线程加速下载。
+
+为什么快：普通 FTP 客户端（含 FileZilla）只能多文件并发，无法把单个大文件切开。
+本工具通过 aria2 把一个大文件分成 N 段并行拉取，绕开服务器的单连接限速。
+
+依赖：Python 3.8+（仅标准库），tkinter
+引擎：aria2 1.37.0（third_party/aria2/aria2c.exe，GPLv2，见同目录 COPYING）
+许可：MIT（本程序），aria2 引擎遵循其自身 GPLv2 许可
+"""
+
+import json
+import os
+import sys
+import time
+import uuid
+import ftplib
+import tempfile
+import threading
+import subprocess
+import urllib.parse
+import urllib.request
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+# ================================ 常量配置 ================================
+
+APP_NAME = "FTP 加速下载器"
+APP_VERSION = "1.1.0"
+
+RPC_PORT = 17890          # aria2 RPC 监听端口（本机回环）
+RPC_TIMEOUT = 10          # 单次 RPC 调用超时（秒）
+
+DEFAULT_HOST = "ftp2.tpdc.ac.cn"   # 默认按 TPDC 填好，可改
+DEFAULT_PORT = "6201"              # TPDC 的 FTP 端口不是 21
+DEFAULT_CONN = "8"                 # 每文件连接数（分段数）
+DEFAULT_JOBS = "1"                 # 同时下载文件数
+
+POLL_MS = 1000            # 队列刷新间隔（毫秒）
+
+CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "FTPAccelerator")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+
+CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+def resource_path(rel):
+    """资源定位：兼容开发态与 PyInstaller 打包态。"""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
+
+
+ARIA2_EXE = resource_path(os.path.join("third_party", "aria2", "aria2c.exe"))
+
+
+def human_size(n):
+    """字节数转可读字符串。"""
+    n = float(n or 0)
+    if n < 1024:
+        return f"{int(n)} B"
+    for unit in ("KB", "MB", "GB", "TB"):
+        n /= 1024
+        if n < 1024 or unit == "TB":
+            return f"{n:.2f} {unit}"
+
+
+def human_duration(sec):
+    """秒数转粗略的中文时长。"""
+    sec = int(max(0, sec))
+    if sec < 60:
+        return f"{sec} 秒"
+    if sec < 3600:
+        return f"{sec // 60} 分"
+    if sec < 86400:
+        return f"{sec // 3600} 时 {sec % 3600 // 60} 分"
+    return f"{sec // 86400} 天 {sec % 86400 // 3600} 时"
+
+
+def join_remote(base, name):
+    """拼接 FTP 远程路径。"""
+    if not base:
+        base = "/"
+    if base.endswith("/"):
+        return f"{base}{name}"
+    return f"{base}/{name}"
+
+
+# ============================ aria2 引擎封装 ============================
+
+
+class Aria2Engine:
+    """管理 aria2c 子进程，并通过 JSON-RPC 下发/查询任务。"""
+
+    def __init__(self, log):
+        self.log = log
+        self.secret = uuid.uuid4().hex
+        self.port = RPC_PORT
+        self.proc = None
+
+    def start(self):
+        if self.proc is not None and self.proc.poll() is None:
+            return
+        if not os.path.exists(ARIA2_EXE):
+            raise FileNotFoundError(f"未找到 aria2 引擎：{ARIA2_EXE}")
+
+        args = [
+            ARIA2_EXE,
+            "--enable-rpc",
+            f"--rpc-listen-port={self.port}",
+            f"--rpc-secret={self.secret}",
+            "--rpc-listen-all=false",
+            "--no-proxy=localhost,127.0.0.1",
+            "--continue=true",
+            # none：不预分配。prealloc 会在下载开始前先把整个文件大小的空间写满，
+            # 几十 GB 的包会把磁盘瞬间打满并卡住系统，务必保持 none。
+            "--file-allocation=none",
+            "--disk-cache=128M",     # 内存写盘缓存，减少磁盘写次数
+            "--max-tries=0",
+            "--retry-wait=20",
+            "--timeout=60",
+            "--connect-timeout=20",
+            "--auto-file-renaming=false",
+            "--allow-overwrite=false",
+            "--summary-interval=0",
+            "--quiet=true",
+        ]
+        self.proc = subprocess.Popen(
+            args,
+            creationflags=CREATE_NO_WINDOW,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        for _ in range(60):
+            try:
+                self.rpc("aria2.getVersion")
+                self.log(f"aria2 引擎已启动（端口 {self.port}）")
+                return
+            except Exception:
+                time.sleep(0.2)
+        raise RuntimeError("aria2 引擎启动超时")
+
+    def stop(self):
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.rpc("aria2.shutdown")
+            except Exception:
+                pass
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+        self.proc = None
+
+    def rpc(self, method, params=None):
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "app",
+            "method": method,
+            "params": [f"token:{self.secret}"] + (params or []),
+        }
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/jsonrpc",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=RPC_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if "error" in data:
+            raise RuntimeError(data["error"].get("message", "RPC 调用失败"))
+        return data.get("result")
+
+    def add_uri(self, url, options):
+        return self.rpc("aria2.addUri", [[url], options])
+
+    def tell_active(self):
+        return self.rpc("aria2.tellActive")
+
+    def tell_waiting(self, offset=0, num=100):
+        return self.rpc("aria2.tellWaiting", [offset, num])
+
+    def tell_stopped(self, offset=0, num=100):
+        return self.rpc("aria2.tellStopped", [offset, num])
+
+    def get_global_stat(self):
+        return self.rpc("aria2.getGlobalStat")
+
+    def change_global(self, options):
+        return self.rpc("aria2.changeGlobalOption", [options])
+
+    def pause(self, gid):
+        return self.rpc("aria2.pause", [gid])
+
+    def unpause(self, gid):
+        return self.rpc("aria2.unpause", [gid])
+
+    def remove(self, gid):
+        try:
+            self.rpc("aria2.forceRemove", [gid])
+        except Exception:
+            pass
+
+
+# ============================== 主界面 ==============================
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title(f"{APP_NAME}  v{APP_VERSION}")
+        self.root.geometry("1240x790")
+        self.root.minsize(1020, 680)
+
+        self.engine = Aria2Engine(self.log)
+
+        self.ftp = None                 # 当前 FTP 连接
+        self.remote_path = "/"          # 当前远程目录
+        self.remote_entries = []        # [(name, is_dir, size)]
+        self.checked = {}               # {远程完整路径: 文件名}
+        self.queue_order = []           # 队列 gid 顺序
+        self.gid_names = {}             # {gid: 文件名}
+        self.last_status = {}           # {gid: 最近一次状态}
+
+        self._build_ui()
+        self._load_config()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        try:
+            self.engine.start()
+        except Exception as exc:
+            self.log(f"引擎启动失败：{exc}")
+            messagebox.showerror("引擎启动失败", str(exc))
+
+        self.root.after(POLL_MS, self._poll)
+
+    # ---------------------------- 界面构建 ----------------------------
+
+    def _build_ui(self):
+        self.var_host = tk.StringVar(value=DEFAULT_HOST)
+        self.var_port = tk.StringVar(value=DEFAULT_PORT)
+        self.var_user = tk.StringVar()
+        self.var_pass = tk.StringVar()
+        self.var_save = tk.StringVar()
+        self.var_conn = tk.StringVar(value=DEFAULT_CONN)
+        self.var_jobs = tk.StringVar(value=DEFAULT_JOBS)
+        self.var_total = tk.StringVar(value="尚未开始")
+        self.var_path = tk.StringVar(value="/")
+
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=3)
+        self.root.rowconfigure(3, weight=2)
+
+        self._build_conn_area()
+        self._build_middle_area()
+        self._build_status_area()
+        self._build_log_area()
+
+    def _build_conn_area(self):
+        frame = ttk.LabelFrame(self.root, text=" 连接设置 ")
+        frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        for col in (1, 3, 5, 7):
+            frame.columnconfigure(col, weight=1)
+
+        ttk.Label(frame, text="主机：").grid(row=0, column=0, padx=(8, 2), pady=4, sticky="e")
+        ttk.Entry(frame, textvariable=self.var_host).grid(row=0, column=1, padx=2, pady=4, sticky="ew")
+
+        ttk.Label(frame, text="端口：").grid(row=0, column=2, padx=(8, 2), pady=4, sticky="e")
+        ttk.Entry(frame, textvariable=self.var_port, width=8).grid(row=0, column=3, padx=2, pady=4, sticky="w")
+
+        ttk.Label(frame, text="用户名：").grid(row=0, column=4, padx=(8, 2), pady=4, sticky="e")
+        ttk.Entry(frame, textvariable=self.var_user).grid(row=0, column=5, padx=2, pady=4, sticky="ew")
+
+        ttk.Label(frame, text="密码：").grid(row=0, column=6, padx=(8, 2), pady=4, sticky="e")
+        ttk.Entry(frame, textvariable=self.var_pass, show="*").grid(row=0, column=7, padx=(2, 8), pady=4, sticky="ew")
+
+        ttk.Button(frame, text="连接", command=self.do_connect).grid(row=0, column=8, padx=4, pady=4)
+        ttk.Button(frame, text="断开", command=self.do_disconnect).grid(row=0, column=9, padx=(0, 8), pady=4)
+
+        ttk.Label(frame, text="保存目录：").grid(row=1, column=0, padx=(8, 2), pady=4, sticky="e")
+        ttk.Entry(frame, textvariable=self.var_save).grid(row=1, column=1, columnspan=6, padx=2, pady=4, sticky="ew")
+        ttk.Button(frame, text="浏览...", command=self.choose_save_dir).grid(row=1, column=7, padx=2, pady=4, sticky="w")
+        ttk.Button(frame, text="打开目录", command=self.open_save_dir).grid(row=1, column=8, padx=4, pady=4)
+
+    def _build_middle_area(self):
+        paned = ttk.Panedwindow(self.root, orient="horizontal")
+        paned.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+
+        # ---- 左：远程文件 ----
+        left = ttk.LabelFrame(paned, text=" 远程文件 ")
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(1, weight=1)
+
+        bar = ttk.Frame(left)
+        bar.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
+        ttk.Button(bar, text="← 上级", command=self.go_parent).pack(side="left")
+        ttk.Button(bar, text="刷新", command=lambda: self.refresh_remote(force=True)).pack(side="left", padx=4)
+        ttk.Label(bar, textvariable=self.var_path, foreground="#4a90d9").pack(side="left", padx=8)
+
+        self.tree_remote = ttk.Treeview(left, columns=("chk", "name", "type", "size"), show="headings", height=15)
+        for col, txt, width, anchor in (
+            ("chk", "选", 36, "center"),
+            ("name", "名称", 300, "w"),
+            ("type", "类型", 60, "center"),
+            ("size", "大小", 90, "e"),
+        ):
+            self.tree_remote.heading(col, text=txt)
+            self.tree_remote.column(col, width=width, anchor=anchor, stretch=(col == "name"))
+        self.tree_remote.grid(row=1, column=0, sticky="nsew", padx=(4, 0), pady=(0, 4))
+        self.tree_remote.bind("<Button-1>", self.on_remote_click)
+        self.tree_remote.bind("<Double-1>", self.on_remote_double)
+
+        sb1 = ttk.Scrollbar(left, orient="vertical", command=self.tree_remote.yview)
+        sb1.grid(row=1, column=1, sticky="ns", padx=(0, 4), pady=(0, 4))
+        self.tree_remote.configure(yscrollcommand=sb1.set)
+
+        ttk.Button(left, text="把勾选的文件加入下载队列 ↓", command=self.add_checked).grid(
+            row=2, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 6)
+        )
+
+        # ---- 右：下载队列 ----
+        right = ttk.LabelFrame(paned, text=" 下载队列 ")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(0, weight=1)
+
+        self.tree_queue = ttk.Treeview(
+            right, columns=("name", "size", "pct", "speed", "eta", "status"),
+            show="headings", height=15,
+        )
+        for col, txt, width, anchor in (
+            ("name", "文件", 210, "w"),
+            ("size", "大小", 78, "e"),
+            ("pct", "进度", 55, "center"),
+            ("speed", "速度", 92, "e"),
+            ("eta", "剩余", 82, "center"),
+            ("status", "状态", 76, "center"),
+        ):
+            self.tree_queue.heading(col, text=txt)
+            self.tree_queue.column(col, width=width, anchor=anchor, stretch=(col == "name"))
+        self.tree_queue.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
+        self.tree_queue.tag_configure("active", foreground="#1f7a3f")
+        self.tree_queue.tag_configure("done", foreground="#8a8a8a")
+        self.tree_queue.tag_configure("error", foreground="#c0392b")
+        self.tree_queue.tag_configure("paused", foreground="#b8860b")
+
+        sb2 = ttk.Scrollbar(right, orient="vertical", command=self.tree_queue.yview)
+        sb2.grid(row=0, column=1, sticky="ns", padx=(0, 4), pady=4)
+        self.tree_queue.configure(yscrollcommand=sb2.set)
+
+        qbar = ttk.Frame(right)
+        qbar.grid(row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 6))
+        ttk.Button(qbar, text="暂停/继续", command=self.toggle_pause).pack(side="left")
+        ttk.Button(qbar, text="移除选中", command=self.remove_selected).pack(side="left", padx=4)
+        ttk.Button(qbar, text="清除已完成", command=self.clear_finished).pack(side="left", padx=4)
+
+        paned.add(left, weight=1)
+        paned.add(right, weight=1)
+
+    def _build_status_area(self):
+        frame = ttk.Frame(self.root)
+        frame.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 4))
+        frame.columnconfigure(0, weight=1)
+
+        top = ttk.Frame(frame)
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(1, weight=1)
+
+        settings = ttk.Frame(top)
+        settings.grid(row=0, column=0, sticky="w")
+        ttk.Label(settings, text="每文件连接数：").pack(side="left")
+        ttk.Spinbox(settings, from_=1, to=16, width=4, textvariable=self.var_conn).pack(side="left")
+        ttk.Label(settings, text="　同时下载文件数：").pack(side="left")
+        ttk.Spinbox(settings, from_=1, to=10, width=4, textvariable=self.var_jobs).pack(side="left")
+        ttk.Button(settings, text="应用", command=self.apply_settings).pack(side="left", padx=6)
+
+        ttk.Label(top, textvariable=self.var_total, foreground="#2e8b57").grid(
+            row=0, column=1, sticky="e", padx=8
+        )
+
+        self.pbar = ttk.Progressbar(frame, mode="determinate", maximum=100)
+        self.pbar.grid(row=1, column=0, sticky="ew", pady=(5, 0))
+
+    def _build_log_area(self):
+        frame = ttk.LabelFrame(self.root, text=" 日志 ")
+        frame.grid(row=3, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        self.txt_log = tk.Text(frame, height=7, wrap="none", state="disabled", background="#1e1e1e",
+                               foreground="#d4d4d4", insertbackground="#d4d4d4")
+        self.txt_log.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self.txt_log.yview)
+        sb.grid(row=0, column=1, sticky="ns", padx=(0, 4), pady=4)
+        self.txt_log.configure(yscrollcommand=sb.set)
+
+    # ---------------------------- 日志 ----------------------------
+
+    def log(self, msg):
+        """线程安全的日志输出。"""
+        stamp = time.strftime("%H:%M:%S")
+
+        def write():
+            self.txt_log.configure(state="normal")
+            self.txt_log.insert("end", f"[{stamp}] {msg}\n")
+            self.txt_log.see("end")
+            self.txt_log.configure(state="disabled")
+
+        self.root.after(0, write)
+
+    # ---------------------------- FTP 连接 ----------------------------
+
+    def do_connect(self):
+        host = self.var_host.get().strip()
+        port = self.var_port.get().strip()
+        user = self.var_user.get().strip()
+        pwd = self.var_pass.get()
+        if not host:
+            messagebox.showwarning("提示", "请填写主机地址")
+            return
+        self.log(f"正在连接 {host}:{port or '21'} ...")
+        threading.Thread(target=self._connect_worker, args=(host, port, user, pwd), daemon=True).start()
+
+    def _connect_worker(self, host, port, user, pwd):
+        try:
+            ftp = ftplib.FTP()
+            ftp.encoding = "utf-8"
+            ftp.connect(host, int(port or 21), timeout=25)
+            ftp.login(user, pwd)
+            self.ftp = ftp
+            self.remote_path = "/"
+            self.log(f"已连接：{host}:{port}（{ftp.getwelcome().strip()[:60]}）")
+            self.root.after(0, lambda: self.refresh_remote(force=True))
+        except Exception as exc:
+            self.log(f"连接失败：{exc}")
+            self.root.after(0, lambda: messagebox.showerror("连接失败", str(exc)))
+
+    def do_disconnect(self):
+        if self.ftp is not None:
+            try:
+                self.ftp.quit()
+            except Exception:
+                try:
+                    self.ftp.close()
+                except Exception:
+                    pass
+            self.ftp = None
+            self.log("已断开连接")
+        self.remote_entries = []
+        self._fill_remote([], "/")
+
+    # ---------------------------- 远程浏览 ----------------------------
+
+    def refresh_remote(self, force=False):
+        if self.ftp is None:
+            if force:
+                self.log("尚未连接，无法列目录")
+            return
+        path = self.remote_path
+        try:
+            entries = self._get_entries(path)
+        except Exception as first_err:
+            # FTP 服务器空闲一段时间会主动踢人，这里自动重连后重试一次
+            self.log(f"列目录失败（{first_err}），尝试重新连接 ...")
+            try:
+                self._reconnect()
+                entries = self._get_entries(path)
+            except Exception as exc:
+                self.log(f"列目录失败：{exc}（已保留上次的列表）")
+                return
+        self.remote_entries = entries
+        self._fill_remote(entries, path)
+        self.log(f"目录 {path}：{len(entries)} 项")
+
+    def _get_entries(self, path):
+        """列出目录内容，优先用 MLSD，服务器不支持时回退到 LIST 解析。"""
+        entries = []
+        try:
+            for name, facts in self.ftp.mlsd(path):
+                if name in (".", ".."):
+                    continue
+                typ = facts.get("type", "")
+                is_dir = typ in ("dir", "cdir", "pdir")
+                size = int(facts.get("size", 0)) if not is_dir else 0
+                entries.append((name, is_dir, size))
+        except Exception:
+            entries = self._list_fallback(path)
+        entries.sort(key=lambda e: (not e[1], e[0].lower()))
+        return entries
+
+    def _reconnect(self):
+        """重建 FTP 控制连接（空闲被服务器断开、或连接被占满时用）。"""
+        if self.ftp is not None:
+            try:
+                self.ftp.close()
+            except Exception:
+                pass
+            self.ftp = None
+        host = self.var_host.get().strip()
+        port = self.var_port.get().strip()
+        ftp = ftplib.FTP()
+        ftp.encoding = "utf-8"
+        ftp.connect(host, int(port or 21), timeout=25)
+        ftp.login(self.var_user.get().strip(), self.var_pass.get())
+        self.ftp = ftp
+        self.log(f"已重新连接 {host}:{port}")
+
+    def _list_fallback(self, path):
+        """MLSD 不可用时回退到 LIST 解析。"""
+        entries = []
+        lines = []
+        self.ftp.retrlines(f"LIST {path}", lines.append)
+        for line in lines:
+            parts = line.split(None, 8)
+            if len(parts) < 9:
+                continue
+            perms, name = parts[0], parts[8]
+            is_dir = perms.startswith("d")
+            try:
+                size = int(parts[4])
+            except ValueError:
+                size = 0
+            entries.append((name, is_dir, 0 if is_dir else size))
+        return entries
+
+    def _fill_remote(self, entries, path):
+        self.var_path.set(path)
+        self.tree_remote.delete(*self.tree_remote.get_children())
+        for idx, (name, is_dir, size) in enumerate(entries):
+            full = join_remote(path, name)
+            checked = full in self.checked
+            self.tree_remote.insert(
+                "", "end", iid=str(idx),
+                values=("☑" if checked else "☐", name, "目录" if is_dir else "文件",
+                        "" if is_dir else human_size(size)),
+            )
+
+    def _clear_checks(self):
+        """只清掉列表里的勾选标记，不重新拉目录 —— 下载中列目录容易被服务器拒。"""
+        for item in self.tree_remote.get_children():
+            self.tree_remote.set(item, "chk", "☐")
+
+    def go_parent(self):
+        if self.remote_path in ("/", ""):
+            return
+        parent = self.remote_path.rstrip("/").rsplit("/", 1)[0]
+        self.remote_path = parent if parent else "/"
+        self.refresh_remote(force=True)
+
+    def on_remote_click(self, event):
+        item = self.tree_remote.identify_row(event.y)
+        if not item:
+            return
+        idx = int(item)
+        name, is_dir, _ = self.remote_entries[idx]
+        if is_dir:
+            return
+        full = join_remote(self.remote_path, name)
+        if full in self.checked:
+            del self.checked[full]
+            mark = "☐"
+        else:
+            self.checked[full] = name
+            mark = "☑"
+        self.tree_remote.set(item, "chk", mark)
+
+    def on_remote_double(self, event):
+        item = self.tree_remote.identify_row(event.y)
+        if not item:
+            return
+        idx = int(item)
+        name, is_dir, _ = self.remote_entries[idx]
+        if not is_dir:
+            return
+        if name == "..":
+            self.go_parent()
+            return
+        self.remote_path = join_remote(self.remote_path, name)
+        self.refresh_remote(force=True)
+
+    # ---------------------------- 下载队列 ----------------------------
+
+    def add_checked(self):
+        if not self.checked:
+            messagebox.showinfo("提示", "还没有勾选任何文件")
+            return
+        if self.engine.proc is None or self.engine.proc.poll() is not None:
+            messagebox.showerror("错误", "aria2 引擎未运行")
+            return
+
+        save_dir = self.var_save.get().strip()
+        if not save_dir:
+            messagebox.showwarning("提示", "请先选择保存目录")
+            return
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+        except Exception as exc:
+            messagebox.showerror("目录不可用", str(exc))
+            return
+
+        host = self.var_host.get().strip()
+        port = self.var_port.get().strip()
+        conn = self.var_conn.get().strip() or DEFAULT_CONN
+        user = self.var_user.get().strip()
+        pwd = self.var_pass.get()
+
+        base_opts = {
+            "dir": save_dir,
+            "split": conn,
+            "max-connection-per-server": conn,
+            "min-split-size": "4M",
+            "continue": "true",
+            # 不预分配：prealloc 会先把整个文件大小的空间写满，几十 GB 的包会瞬间打满磁盘
+            "file-allocation": "none",
+            "max-tries": "0",
+            "retry-wait": "20",
+            "timeout": "60",
+            "connect-timeout": "20",
+            "auto-file-renaming": "false",
+            "allow-overwrite": "false",
+        }
+        if user:
+            base_opts["ftp-user"] = user
+            base_opts["ftp-passwd"] = pwd
+
+        added = 0
+        for remote, name in list(self.checked.items()):
+            url = f"ftp://{host}:{port}{urllib.parse.quote(remote)}"
+            opts = dict(base_opts)
+            opts["out"] = name
+            try:
+                gid = self.engine.add_uri(url, opts)
+                self.gid_names[gid] = name
+                self.queue_order.append(gid)
+                self.tree_queue.insert("", "end", iid=gid,
+                                       values=(name, "-", "0%", "-", "-", "排队中"))
+                added += 1
+            except Exception as exc:
+                self.log(f"加入失败 {name}：{exc}")
+
+        self.checked.clear()
+        self._clear_checks()
+        jobs = self.var_jobs.get().strip() or "1"
+        self.log(f"已加入队列：{added} 个文件（引擎同时下载 {jobs} 个，其余排队中）")
+        self.apply_settings()
+
+    def toggle_pause(self):
+        sel = self.tree_queue.selection()
+        if not sel:
+            return
+        for gid in sel:
+            try:
+                self.engine.pause(gid)
+            except Exception:
+                try:
+                    self.engine.unpause(gid)
+                except Exception:
+                    pass
+
+    def remove_selected(self):
+        for gid in list(self.tree_queue.selection()):
+            self.engine.remove(gid)
+            try:
+                self.tree_queue.delete(gid)
+            except Exception:
+                pass
+            self.gid_names.pop(gid, None)
+            self.last_status.pop(gid, None)
+            if gid in self.queue_order:
+                self.queue_order.remove(gid)
+
+    def clear_finished(self):
+        """从队列里清掉已完成 / 出错 / 已移除的记录。"""
+        count = 0
+        for gid in list(self.gid_names.keys()):
+            if self.last_status.get(gid) in ("complete", "error", "removed"):
+                self.engine.remove(gid)
+                if self.tree_queue.exists(gid):
+                    self.tree_queue.delete(gid)
+                self.gid_names.pop(gid, None)
+                self.last_status.pop(gid, None)
+                if gid in self.queue_order:
+                    self.queue_order.remove(gid)
+                count += 1
+        self.log(f"已清除 {count} 条已完成/出错的记录")
+
+    def _poll(self):
+        """定时从 aria2 拉取任务状态并刷新界面。"""
+        try:
+            if self.engine.proc is None or self.engine.proc.poll() is not None:
+                self.root.after(POLL_MS, self._poll)
+                return
+
+            tasks = {}
+            for group in (self.engine.tell_active(),
+                          self.engine.tell_waiting(0, 200),
+                          self.engine.tell_stopped(0, 200)):
+                for t in group:
+                    if t["gid"] in self.gid_names:
+                        tasks[t["gid"]] = t
+
+            sum_total = 0
+            sum_done = 0
+            finished = 0
+
+            for gid, t in tasks.items():
+                total = int(t.get("totalLength", 0) or 0)
+                done = int(t.get("completedLength", 0) or 0)
+                speed = int(t.get("downloadSpeed", 0) or 0)
+                status = t.get("status", "")
+                self.last_status[gid] = status
+
+                pct = f"{done * 100 // total}%" if total else "0%"
+                text = {
+                    "active": "下载中", "waiting": "排队中", "paused": "已暂停",
+                    "complete": "完成", "removed": "已移除",
+                }.get(status, status)
+                if status == "error":
+                    text = f"出错 {t.get('errorCode', '')}"
+                tag = {
+                    "active": "active", "complete": "done",
+                    "error": "error", "paused": "paused",
+                }.get(status, "")
+
+                eta = "-"
+                if status == "active" and speed > 0 and total > done:
+                    eta = human_duration((total - done) / speed)
+
+                self.tree_queue.item(gid, values=(
+                    self.gid_names.get(gid, ""),
+                    human_size(total) if total else "-",
+                    pct,
+                    f"{human_size(speed)}/s" if speed else "-",
+                    eta,
+                    text,
+                ), tags=(tag,) if tag else ())
+
+                sum_total += total
+                sum_done += done
+                if status in ("complete", "error", "removed"):
+                    finished += 1
+
+            stat = self.engine.get_global_stat()
+            speed_total = int(stat.get("downloadSpeed", 0) or 0)
+            queued = sum(1 for g in self.gid_names if self.tree_queue.exists(g))
+
+            self.pbar.configure(value=(sum_done / sum_total * 100) if sum_total else 0)
+
+            if speed_total > 0 and sum_total > sum_done:
+                eta_text = human_duration((sum_total - sum_done) / speed_total)
+            elif queued and finished >= queued:
+                eta_text = "已完成"
+            else:
+                eta_text = "-"
+
+            self.var_total.set(
+                f"已完成 {finished}/{queued}　总速度 {human_size(speed_total)}/s　"
+                f"预计剩余 {eta_text}"
+            )
+        except Exception:
+            pass
+        self.root.after(POLL_MS, self._poll)
+
+    # ---------------------------- 设置 / 杂项 ----------------------------
+
+    def apply_settings(self):
+        jobs = self.var_jobs.get().strip() or "1"
+        try:
+            self.engine.change_global({"max-concurrent-downloads": jobs})
+            self.log(f"同时下载文件数已设为 {jobs}，每文件连接数 {self.var_conn.get()}")
+        except Exception as exc:
+            self.log(f"应用设置失败：{exc}")
+
+    def choose_save_dir(self):
+        path = filedialog.askdirectory(title="选择保存目录")
+        if path:
+            self.var_save.set(path)
+
+    def open_save_dir(self):
+        path = self.var_save.get().strip()
+        if not path or not os.path.isdir(path):
+            messagebox.showwarning("提示", "保存目录不存在")
+            return
+        if os.name == "nt":
+            os.startfile(path)
+        else:
+            subprocess.Popen(["xdg-open", path])
+
+    # ---------------------------- 配置持久化 ----------------------------
+
+    def _load_config(self):
+        cfg = {}
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+        self.var_host.set(cfg.get("host", DEFAULT_HOST))
+        self.var_port.set(cfg.get("port", DEFAULT_PORT))
+        self.var_user.set(cfg.get("user", ""))
+        self.var_save.set(cfg.get("save_dir", os.path.join(os.path.expanduser("~"), "Downloads")))
+        self.var_conn.set(cfg.get("conn", DEFAULT_CONN))
+        self.var_jobs.set(cfg.get("jobs", DEFAULT_JOBS))
+
+    def _save_config(self):
+        cfg = {
+            "host": self.var_host.get(),
+            "port": self.var_port.get(),
+            "user": self.var_user.get(),
+            "save_dir": self.var_save.get(),
+            "conn": self.var_conn.get(),
+            "jobs": self.var_jobs.get(),
+        }
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def on_close(self):
+        self._save_config()
+        self.engine.stop()
+        self.root.destroy()
+
+
+def enable_hidpi():
+    """Windows 高 DPI 下让界面不发虚。"""
+    if os.name != "nt":
+        return
+    try:
+        from ctypes import windll
+        windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+
+
+def run_selftest():
+    """无界面自检：启动引擎并调用 RPC，验证打包产物是否完整。
+
+    打包成 --windowed 后没有 stdout，结果写到临时文件，用退出码表示成败。
+    """
+    lines = []
+    code = 0
+    try:
+        engine = Aria2Engine(lines.append)
+        engine.start()
+        lines.append("aria2 version: " + engine.rpc("aria2.getVersion")["version"])
+        lines.append("global stat: " + json.dumps(engine.get_global_stat()))
+        engine.stop()
+        lines.append("SELFTEST OK")
+    except Exception as exc:
+        lines.append("SELFTEST FAIL: " + repr(exc))
+        code = 1
+    out = os.path.join(tempfile.gettempdir(), "ftp_accel_selftest.txt")
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+    return code
+
+
+def main():
+    if "--selftest" in sys.argv:
+        sys.exit(run_selftest())
+    enable_hidpi()
+    root = tk.Tk()
+    try:
+        ttk.Style().theme_use("vista")
+    except Exception:
+        pass
+    App(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
