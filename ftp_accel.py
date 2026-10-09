@@ -32,7 +32,7 @@ from tkinter import ttk, filedialog, messagebox
 # ================================ 常量配置 ================================
 
 APP_NAME = "FTP 加速下载器"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 RPC_TIMEOUT = 10          # 单次 RPC 调用超时（秒）
 
@@ -66,6 +66,13 @@ FG_WARN = "#956400"       # 暂停
 
 FONT_UI = ("Microsoft YaHei UI", 9)
 FONT_MONO = ("Consolas", 9)
+
+# ---- 仿 Mac 窗口 ----
+TITLEBAR_BG = "#F2F1EE"   # 标题栏（比画布略深一档）
+DOT_CLOSE = "#FF5F57"     # 红：关闭
+DOT_MIN = "#FEBC2E"       # 黄：最小化
+DOT_MAX = "#28C840"       # 绿：最大化 / 还原
+TITLEBAR_H = 38           # 标题栏高度
 
 
 def resource_path(rel):
@@ -193,6 +200,30 @@ def apply_theme(root):
     style.map("TScrollbar",
               background=[("active", "#BEBDB9")],
               arrowcolor=[("active", TEXT)])
+
+
+def strip_window_chrome(root):
+    """摘掉 Windows 原生标题栏，但保留可缩放边框和任务栏图标（仿 Mac 无边框窗口）。
+
+    只用 tkinter 的 overrideredirect(True) 会让窗口从任务栏消失、且无法最小化，
+    所以改走 Win32 窗口样式：仅去掉 WS_CAPTION。
+    """
+    if os.name != "nt":
+        return
+    import ctypes
+
+    gwl_style = -16
+    ws_caption = 0x00C00000
+
+    root.update_idletasks()
+    hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+    if not hwnd:
+        hwnd = root.winfo_id()
+    style = ctypes.windll.user32.GetWindowLongW(hwnd, gwl_style)
+    ctypes.windll.user32.SetWindowLongW(hwnd, gwl_style, style & ~ws_caption)
+    # 样式改动要重挂一次窗口才生效
+    root.withdraw()
+    root.deiconify()
 
 
 # ============================ aria2 引擎封装 ============================
@@ -343,8 +374,11 @@ class App:
         self.poll_errors = 0              # 队列刷新异常计数
         self.last_jobs = None             # 上次应用的并发数
         self.ui_queue = queue.Queue()     # 后台线程 -> 主线程 的 UI 操作队列
+        self.maximized = False            # 窗口是否已最大化
+        self.restore_geom = ""            # 还原用的几何串
 
         self._build_ui()
+        strip_window_chrome(self.root)    # 摘掉原生标题栏，换成自绘的
         self._load_config()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -360,6 +394,58 @@ class App:
 
     # ---------------------------- 界面构建 ----------------------------
 
+    def _build_titlebar(self):
+        """仿 Mac 的标题栏：左侧三个圆点、中间标题，整条可拖动。"""
+        bar = tk.Frame(self.root, bg=TITLEBAR_BG, height=TITLEBAR_H)
+        bar.grid(row=0, column=0, sticky="ew")
+        bar.grid_propagate(False)
+
+        dots = tk.Canvas(bar, width=72, height=TITLEBAR_H, bg=TITLEBAR_BG,
+                         highlightthickness=0, cursor="hand2")
+        dots.pack(side="left", padx=(14, 0))
+        for i, color in enumerate((DOT_CLOSE, DOT_MIN, DOT_MAX)):
+            x = 6 + i * 22
+            dots.create_oval(x, 13, x + 13, 26, fill=color, outline="")
+        dots.bind("<Button-1>", self._on_dot_click)
+
+        title = tk.Label(bar, text=APP_NAME, bg=TITLEBAR_BG, fg=TEXT_MUTED, font=FONT_UI)
+        title.place(relx=0.5, rely=0.5, anchor="center")
+
+        for widget in (bar, title):
+            widget.bind("<Button-1>", self._start_drag)
+            widget.bind("<B1-Motion>", self._on_drag)
+        bar.bind("<Double-Button-1>", lambda e: self._toggle_maximize())
+
+    def _on_dot_click(self, event):
+        if event.x < 24:
+            self.on_close()
+        elif event.x < 46:
+            self._minimize()
+        else:
+            self._toggle_maximize()
+
+    def _start_drag(self, event):
+        self._drag_dx = event.x_root - self.root.winfo_x()
+        self._drag_dy = event.y_root - self.root.winfo_y()
+
+    def _on_drag(self, event):
+        x = event.x_root - self._drag_dx
+        y = event.y_root - self._drag_dy
+        self.root.geometry(f"+{x}+{y}")
+
+    def _minimize(self):
+        self.root.iconify()
+
+    def _toggle_maximize(self):
+        if self.maximized:
+            self.root.state("normal")
+            if self.restore_geom:
+                self.root.geometry(self.restore_geom)
+        else:
+            self.restore_geom = self.root.geometry()
+            self.root.state("zoomed")
+        self.maximized = not self.maximized
+
     def _build_ui(self):
         self.var_host = tk.StringVar(value=DEFAULT_HOST)
         self.var_port = tk.StringVar(value=DEFAULT_PORT)
@@ -372,8 +458,16 @@ class App:
         self.var_path = tk.StringVar(value="/")
 
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(1, weight=3)
-        self.root.rowconfigure(3, weight=2)
+        self.root.rowconfigure(1, weight=1)
+
+        self._build_titlebar()
+
+        # 原生标题栏随后会被摘掉，内容全部挂在 content 里
+        self.content = tk.Frame(self.root, bg=BG)
+        self.content.grid(row=1, column=0, sticky="nsew")
+        self.content.columnconfigure(0, weight=1)
+        self.content.rowconfigure(1, weight=3)
+        self.content.rowconfigure(3, weight=2)
 
         self._build_conn_area()
         self._build_middle_area()
@@ -381,7 +475,7 @@ class App:
         self._build_log_area()
 
     def _build_conn_area(self):
-        frame = ttk.LabelFrame(self.root, text=" 连接设置 ")
+        frame = ttk.LabelFrame(self.content, text=" 连接设置 ")
         frame.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
         for col in (1, 3, 5, 7):
             frame.columnconfigure(col, weight=1)
@@ -421,7 +515,7 @@ class App:
             row=1, column=8, padx=4, pady=(0, 9))
 
     def _build_middle_area(self):
-        mid = ttk.Frame(self.root)
+        mid = ttk.Frame(self.content)
         mid.grid(row=1, column=0, sticky="nsew", padx=12, pady=6)
         mid.columnconfigure(0, weight=4)
         mid.columnconfigure(1, weight=6)
@@ -501,7 +595,7 @@ class App:
         ttk.Button(qbar, text="清除已完成", command=self.clear_finished).pack(side="left")
 
     def _build_status_area(self):
-        frame = ttk.Frame(self.root)
+        frame = ttk.Frame(self.content)
         frame.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 6))
         frame.columnconfigure(0, weight=1)
 
@@ -526,7 +620,7 @@ class App:
         self.pbar.grid(row=1, column=0, sticky="ew", pady=(8, 0))
 
     def _build_log_area(self):
-        frame = ttk.LabelFrame(self.root, text=" 日志 ")
+        frame = ttk.LabelFrame(self.content, text=" 日志 ")
         frame.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 12))
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
