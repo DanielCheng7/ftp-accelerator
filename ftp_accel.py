@@ -27,12 +27,13 @@ import subprocess
 import urllib.parse
 import urllib.request
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox
 
 # ================================ 常量配置 ================================
 
 APP_NAME = "FTP 加速下载器"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 RPC_TIMEOUT = 10          # 单次 RPC 调用超时（秒）
 
@@ -48,27 +49,30 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
-# ---- 界面色板（暖色单色调 + 低饱和 pastel）----
-BG = "#FBFBFA"            # 画布
-SURFACE = "#FFFFFF"       # 卡片 / 输入框
-SURFACE_ALT = "#F7F6F3"   # 次级表面 / hover
-BORDER = "#EAEAEA"        # 分隔线 / 细边框
-TEXT = "#2F3437"          # 正文（不用纯黑）
-TEXT_MUTED = "#787774"    # 次要文字
-ACCENT = "#111111"        # 主按钮
-ACCENT_HOVER = "#333333"
-SEL_BG = "#E8EEF2"        # 选中行
+# ---- 设计令牌（与 word-hub / coord-kit / life-map 四应用共用那一套）----
+BG = "#f5f5f7"            # --bg   页面背景
+SURFACE = "#ffffff"       # --card 卡片
+SURFACE_ALT = "#ececf0"   # 次级表面 / hover（近似 --soft2）
+BORDER = "#e1e1e3"        # --line 细边框（rgba(0,0,0,.08) 的等效实色）
+TEXT = "#1d1d1f"          # --text 正文
+TEXT_MUTED = "#56565c"    # --muted 次要文字
+BRAND = "#0071e3"         # --brand 品牌蓝
+BRAND_HOVER = "#1a82e6"
+BRAND_PRESS = "#0062c4"
+BRAND_SOFT = "#e8f1fc"    # 近似 --brand-soft
+SEL_BG = "#e8f1fc"        # 选中行
 
-FG_OK = "#346538"         # 下载中
-FG_DONE = "#787774"       # 完成
-FG_ERR = "#9F2F2D"        # 出错
-FG_WARN = "#956400"       # 暂停
+FG_OK = "#34c759"         # --ok   下载中
+FG_DONE = "#56565c"       # 完成（用 muted）
+FG_ERR = "#ff3b30"        # --err  出错
+FG_WARN = "#ff9500"       # --warn 暂停
 
-FONT_UI = ("Microsoft YaHei UI", 9)
+FONT_UI_FAMILY = "Microsoft YaHei UI"   # apply_theme() 会按字体栈挑本机可用的
+FONT_UI = (FONT_UI_FAMILY, 9)
 FONT_MONO = ("Consolas", 9)
 
 # ---- 仿 Mac 窗口 ----
-TITLEBAR_BG = "#F2F1EE"   # 标题栏（比画布略深一档）
+TITLEBAR_BG = "#f0f0f2"   # 标题栏（比画布略深一档）
 DOT_CLOSE = "#FF5F57"     # 红：关闭
 DOT_MIN = "#FEBC2E"       # 黄：最小化
 DOT_MAX = "#28C840"       # 绿：最大化 / 还原
@@ -138,67 +142,84 @@ def free_port():
         return s.getsockname()[1]
 
 
+def pick_ui_font():
+    """按 word-hub 的字体栈挑一个本机可用的（MiSans → PingFang → YaHei UI）。"""
+    for name in ("MiSans", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei"):
+        try:
+            if name in tkfont.families():
+                return name
+        except Exception:
+            break
+    return FONT_UI_FAMILY
+
+
 def apply_theme(root):
-    """克制的浅色主题：细边框、无阴影、低饱和。"""
+    """四应用共用设计令牌：浅色画布 + 白卡 + 品牌蓝强调。"""
+    global FONT_UI, FONT_UI_FAMILY
+
     style = ttk.Style(root)
     try:
         style.theme_use("clam")      # clam 可定制性最好；vista 改不动颜色
     except tk.TclError:
         pass
 
+    FONT_UI_FAMILY = pick_ui_font()
+    FONT_UI = (FONT_UI_FAMILY, 9)
+
     root.configure(bg=BG)
 
-    style.configure(".", background=BG, foreground=TEXT, font=FONT_UI)
-    style.configure("TFrame", background=BG)
-    style.configure("TLabel", background=BG, foreground=TEXT, font=FONT_UI)
-    style.configure("Muted.TLabel", foreground=TEXT_MUTED)
+    # 默认白底：卡片（Labelframe）内部的所有 ttk 控件自动是卡片色
+    style.configure(".", background=SURFACE, foreground=TEXT, font=FONT_UI)
+    style.configure("TFrame", background=SURFACE)
+    style.configure("Bg.TFrame", background=BG)          # 外层容器用画布色
+    style.configure("TLabel", background=SURFACE, foreground=TEXT, font=FONT_UI)
+    style.configure("Muted.TLabel", background=SURFACE, foreground=TEXT_MUTED)
+    style.configure("Bg.TLabel", background=BG, foreground=TEXT_MUTED)
 
-    style.configure("TLabelframe", background=BG, bordercolor=BORDER,
+    style.configure("TLabelframe", background=SURFACE, bordercolor=BORDER,
                     relief="solid", borderwidth=1)
-    style.configure("TLabelframe.Label", background=BG, foreground=TEXT_MUTED, font=FONT_UI)
+    style.configure("TLabelframe.Label", background=SURFACE, foreground=TEXT_MUTED,
+                    font=FONT_UI)
 
     style.configure("TEntry", fieldbackground=SURFACE, foreground=TEXT,
                     bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
-                    insertcolor=TEXT, padding=4, relief="flat")
-    style.map("TEntry", bordercolor=[("focus", TEXT_MUTED)])
+                    insertcolor=TEXT, padding=5, relief="flat")
+    style.map("TEntry", bordercolor=[("focus", BRAND)])
 
     style.configure("TSpinbox", fieldbackground=SURFACE, foreground=TEXT,
                     bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
-                    arrowcolor=TEXT_MUTED, insertcolor=TEXT, padding=3, relief="flat")
+                    arrowcolor=TEXT_MUTED, insertcolor=TEXT, padding=4, relief="flat")
 
-    style.configure("TButton", background=SURFACE, foreground=TEXT,
-                    bordercolor=BORDER, lightcolor=SURFACE, darkcolor=SURFACE,
-                    relief="flat", padding=(10, 5), font=FONT_UI)
+    style.configure("TButton", background=SURFACE_ALT, foreground=TEXT,
+                    bordercolor=BORDER, lightcolor=SURFACE_ALT, darkcolor=SURFACE_ALT,
+                    relief="flat", padding=(12, 6), font=FONT_UI)
     style.map("TButton",
-              background=[("active", SURFACE_ALT), ("pressed", "#E8E7E4")],
+              background=[("active", "#e2e2e6"), ("pressed", "#d8d8dd")],
               bordercolor=[("active", TEXT_MUTED)])
 
-    style.configure("Accent.TButton", background=ACCENT, foreground="#FFFFFF",
-                    bordercolor=ACCENT, lightcolor=ACCENT, darkcolor=ACCENT,
-                    relief="flat", padding=(12, 5), font=FONT_UI)
+    style.configure("Accent.TButton", background=BRAND, foreground="#ffffff",
+                    bordercolor=BRAND, lightcolor=BRAND, darkcolor=BRAND,
+                    relief="flat", padding=(14, 6), font=FONT_UI)
     style.map("Accent.TButton",
-              background=[("active", ACCENT_HOVER), ("pressed", "#000000")])
+              background=[("active", BRAND_HOVER), ("pressed", BRAND_PRESS)])
 
     style.configure("Treeview", background=SURFACE, fieldbackground=SURFACE,
                     foreground=TEXT, bordercolor=BORDER, rowheight=26,
                     relief="flat", font=FONT_UI)
     style.configure("Treeview.Heading", background=BG, foreground=TEXT_MUTED,
-                    relief="flat", font=FONT_UI, padding=(4, 5))
+                    relief="flat", font=FONT_UI, padding=(4, 6))
     style.map("Treeview.Heading", background=[("active", SURFACE_ALT)])
     style.map("Treeview",
               background=[("selected", SEL_BG)],
               foreground=[("selected", TEXT)])
 
-    style.configure("TProgressbar", background=ACCENT, troughcolor="#EDEDEB",
-                    bordercolor=BORDER, lightcolor=ACCENT, darkcolor=ACCENT, thickness=6)
+    style.configure("TProgressbar", background=BRAND, troughcolor="#e5e5e9",
+                    bordercolor=BORDER, lightcolor=BRAND, darkcolor=BRAND, thickness=6)
 
-    style.configure("TPanedwindow", background=BG)
-    style.configure("Sash", background=BORDER, sashthickness=6)
-
-    style.configure("TScrollbar", background="#D8D7D4", troughcolor=BG,
+    style.configure("TScrollbar", background="#c9c9ce", troughcolor=BG,
                     bordercolor=BG, arrowcolor=TEXT_MUTED, relief="flat", arrowsize=12)
     style.map("TScrollbar",
-              background=[("active", "#BEBDB9")],
+              background=[("active", "#b0b0b6")],
               arrowcolor=[("active", TEXT)])
 
 
@@ -515,7 +536,7 @@ class App:
             row=1, column=8, padx=4, pady=(0, 9))
 
     def _build_middle_area(self):
-        mid = ttk.Frame(self.content)
+        mid = ttk.Frame(self.content, style="Bg.TFrame")
         mid.grid(row=1, column=0, sticky="nsew", padx=12, pady=6)
         mid.columnconfigure(0, weight=4)
         mid.columnconfigure(1, weight=6)
@@ -595,25 +616,25 @@ class App:
         ttk.Button(qbar, text="清除已完成", command=self.clear_finished).pack(side="left")
 
     def _build_status_area(self):
-        frame = ttk.Frame(self.content)
+        frame = ttk.Frame(self.content, style="Bg.TFrame")
         frame.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 6))
         frame.columnconfigure(0, weight=1)
 
-        top = ttk.Frame(frame)
+        top = ttk.Frame(frame, style="Bg.TFrame")
         top.grid(row=0, column=0, sticky="ew")
         top.columnconfigure(1, weight=1)
 
-        settings = ttk.Frame(top)
+        settings = ttk.Frame(top, style="Bg.TFrame")
         settings.grid(row=0, column=0, sticky="w")
-        ttk.Label(settings, text="每文件连接数", foreground=TEXT_MUTED).pack(side="left")
+        ttk.Label(settings, text="每文件连接数", style="Bg.TLabel").pack(side="left")
         ttk.Spinbox(settings, from_=1, to=16, width=4,
                     textvariable=self.var_conn).pack(side="left", padx=(6, 16))
-        ttk.Label(settings, text="同时下载文件数", foreground=TEXT_MUTED).pack(side="left")
+        ttk.Label(settings, text="同时下载文件数", style="Bg.TLabel").pack(side="left")
         ttk.Spinbox(settings, from_=1, to=10, width=4,
                     textvariable=self.var_jobs).pack(side="left", padx=(6, 12))
         ttk.Button(settings, text="应用", command=self.apply_settings).pack(side="left")
 
-        ttk.Label(top, textvariable=self.var_total, foreground=TEXT).grid(
+        ttk.Label(top, textvariable=self.var_total, background=BG, foreground=TEXT).grid(
             row=0, column=1, sticky="e", padx=8)
 
         self.pbar = ttk.Progressbar(frame, mode="determinate", maximum=100)
@@ -626,7 +647,7 @@ class App:
         frame.rowconfigure(0, weight=1)
 
         self.txt_log = tk.Text(frame, height=7, wrap="none", state="disabled",
-                               background=BG, foreground=TEXT_MUTED,
+                               background=SURFACE, foreground=TEXT_MUTED,
                                relief="flat", borderwidth=0, font=FONT_MONO,
                                highlightthickness=0, selectbackground=SEL_BG)
         self.txt_log.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
