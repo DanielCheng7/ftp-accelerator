@@ -33,7 +33,7 @@ from tkinter import ttk, filedialog, messagebox
 # ================================ 常量配置 ================================
 
 APP_NAME = "FTP 加速下载器"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 RPC_TIMEOUT = 10          # 单次 RPC 调用超时（秒）
 
@@ -41,6 +41,8 @@ DEFAULT_HOST = "ftp2.tpdc.ac.cn"   # 默认按 TPDC 填好，可改
 DEFAULT_PORT = "6201"              # TPDC 的 FTP 端口不是 21
 DEFAULT_CONN = "8"                 # 每文件连接数（分段数）
 DEFAULT_JOBS = "1"                 # 同时下载文件数
+MAX_CONN = 16                      # aria2 的 max-connection-per-server 硬上限就是 16，超了任务会被直接拒绝
+MAX_JOBS = 10                      # 同时下载文件数上限
 
 POLL_MS = 1000            # 队列刷新间隔（毫秒）
 
@@ -142,6 +144,84 @@ def free_port():
         return s.getsockname()[1]
 
 
+def clamp_int(text, lo, hi, default):
+    """把界面上读到的数字收敛到合法区间。
+
+    ttk.Spinbox 的输入框是可以手打的，`from_/to=` 只约束箭头不约束键盘。
+    一旦手输 20，aria2 会以「max-connection-per-server 必须在 1-16 之间」为由
+    直接把整个任务拒掉 —— 所以在送进引擎之前先钳住。
+    """
+    try:
+        value = int(float(str(text).strip()))
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(lo, min(hi, value))
+
+
+def build_download_options(save_dir, conn, user="", pwd=""):
+    """构造每个下载任务传给 aria2 的选项。
+
+    单独抽出来是为了让「应用实际用的参数」和「测试断言用的参数」是同一份，
+    否则测试很容易在自己复制的一份参数上通过，而应用里早就改歪了。
+    取值依据见 third_party/aria2/aria2c.exe --help=#all。
+    """
+    conn = str(conn)
+    opts = {
+        "dir": save_dir,
+        "split": conn,
+        # aria2 硬上限 16（-x 的 Possible Values 就是 1-16），超了任务会被直接拒绝
+        "max-connection-per-server": conn,
+        # aria2 不会把文件切成小于 2*SIZE 的段。取 1M（即最小 2M 一段）后，
+        # 中小文件也能拿满 conn 条连接；几十 GB 的大文件段数由 split 封顶，不受影响。
+        "min-split-size": "1M",
+        "continue": "true",
+        # 不预分配：prealloc 会先把整个文件大小的空间写满，几十 GB 的包会瞬间打满磁盘
+        "file-allocation": "none",
+        "max-tries": "0",
+        # 服务器 2 分钟会踢掉空闲连接；等 20 秒才重连是白等
+        "retry-wait": "5",
+        # 某条连接真的卡死（服务器不再吐数据）时果断弃掉重连，
+        # 否则一条僵死的分段会把整个任务拖成龟速
+        "lowest-speed-limit": "1K",
+        "timeout": "60",
+        "connect-timeout": "20",
+        "auto-file-renaming": "false",
+        "allow-overwrite": "false",
+    }
+    if user:
+        opts["ftp-user"] = user
+        opts["ftp-passwd"] = pwd
+    return opts
+
+
+def build_engine_args(port, secret):
+    """aria2c 的完整启动命令行。抽成函数是为了让测试能拿到应用真正跑的那一份。"""
+    return [
+        ARIA2_EXE,
+        "--enable-rpc",
+        f"--rpc-listen-port={port}",
+        f"--rpc-secret={secret}",
+        "--rpc-listen-all=false",
+        "--no-proxy=localhost,127.0.0.1",
+        # 关掉用户级配置文件：本版 aria2 默认会加载 ~/.config/aria2/aria2.conf，
+        # 若那里残留 max-overall-download-limit 之类的设置，会在背后把速度掐住而难以察觉。
+        "--no-conf=true",
+        "--continue=true",
+        # none：不预分配。prealloc 会在下载开始前先把整个文件大小的空间写满，
+        # 几十 GB 的包会把磁盘瞬间打满并卡住系统，务必保持 none。
+        "--file-allocation=none",
+        "--disk-cache=128M",     # 内存写盘缓存，减少磁盘写次数
+        "--max-tries=0",
+        "--retry-wait=5",        # 掉线后 5 秒即重连（服务器 2 分钟会踢掉空闲连接，等 20 秒是白等）
+        "--timeout=60",
+        "--connect-timeout=20",
+        "--auto-file-renaming=false",
+        "--allow-overwrite=false",
+        "--summary-interval=0",
+        "--quiet=true",
+    ]
+
+
 def pick_ui_font():
     """按 word-hub 的字体栈挑一个本机可用的（MiSans → PingFang → YaHei UI）。"""
     for name in ("MiSans", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei"):
@@ -228,6 +308,10 @@ def strip_window_chrome(root):
 
     只用 tkinter 的 overrideredirect(True) 会让窗口从任务栏消失、且无法最小化，
     所以改走 Win32 窗口样式：仅去掉 WS_CAPTION。
+
+    ⚠️ 改完样式一定要用 SetWindowPos(SWP_FRAMECHANGED) 让系统重算非客户区。
+    早先靠 withdraw()/deiconify() 糊弄，结果原标题栏的位置残留成一条空白，
+    表现就是「第一次拖动窗口时顶部冒出一条多余的栏」。
     """
     if os.name != "nt":
         return
@@ -235,6 +319,7 @@ def strip_window_chrome(root):
 
     gwl_style = -16
     ws_caption = 0x00C00000
+    swp_nosize, swp_nomove, swp_nozorder, swp_framechanged = 0x0001, 0x0002, 0x0004, 0x0020
 
     root.update_idletasks()
     hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
@@ -242,9 +327,113 @@ def strip_window_chrome(root):
         hwnd = root.winfo_id()
     style = ctypes.windll.user32.GetWindowLongW(hwnd, gwl_style)
     ctypes.windll.user32.SetWindowLongW(hwnd, gwl_style, style & ~ws_caption)
-    # 样式改动要重挂一次窗口才生效
-    root.withdraw()
-    root.deiconify()
+    ctypes.windll.user32.SetWindowPos(
+        hwnd, 0, 0, 0, 0, 0,
+        swp_nosize | swp_nomove | swp_nozorder | swp_framechanged)
+
+
+def mix_color(c1, c2, t):
+    """两个 #rrggbb 之间按 t 线性插值（t=0 取 c1，t=1 取 c2）。"""
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{int(a[i] + (b[i] - a[i]) * t):02x}" for i in range(3))
+
+
+class GlassButton(tk.Canvas):
+    """自绘胶囊按钮，带玻璃质感（垂直渐变 + 顶部高光 + 底部收边）。
+
+    ttk.Button 是矩形、既没圆角也没渐变，做不出 word-hub 那种胶囊按钮，
+    所以这里用 Canvas 逐行扫描线把圆角矩形和垂直渐变一起画出来。
+    用法与 ttk.Button 基本一致：GlassButton(parent, text=…, command=…).pack(…)
+    """
+
+    #                  normal上    normal下    hover上    hover下    press上    press下    文字色
+    PALETTE = {
+        "primary": ("#3d9bf0", "#0071e3", "#57a9f5", "#0a7fe8",
+                    "#0062c4", "#006edb", "#ffffff"),
+        "default": ("#ffffff", "#f2f2f6", "#ffffff", "#e9e9ef",
+                    "#e4e4ec", "#dcdce4", TEXT),
+    }
+
+    def __init__(self, parent, text, command=None, kind="default",
+                 padx=20, pady=9, bg=SURFACE):
+        self.command = command
+        self.kind = kind
+        self.text = text
+        self.enabled = True
+        self._state = "normal"
+
+        font = tkfont.Font(family=FONT_UI[0], size=FONT_UI[1])
+        w = font.measure(text) + padx * 2
+        h = font.metrics("linespace") + pady * 2
+
+        super().__init__(parent, width=w, height=h, bg=bg,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self._font = font
+        # 注意：别用 self._w / self._h —— 那是 tkinter 内部的 widget 路径名，覆盖会炸
+        self._cw, self._ch = w, h
+        self._radius = h / 2.0      # 胶囊
+
+        self._render()
+        self.bind("<Enter>", lambda e: self._set_state("hover"))
+        self.bind("<Leave>", lambda e: self._set_state("normal"))
+        self.bind("<Button-1>", lambda e: self._set_state("press"))
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    def _set_state(self, state):
+        if self.enabled:
+            self._state = state
+            self._render()
+
+    def _on_release(self, event):
+        if not self.enabled:
+            return
+        inside = 0 <= event.x <= self._cw and 0 <= event.y <= self._ch
+        self._set_state("hover" if inside else "normal")
+        if inside and self.command:
+            self.command()
+
+    def set_enabled(self, enabled):
+        self.enabled = enabled
+        self.configure(cursor="hand2" if enabled else "arrow")
+        self._render()
+
+    def _row_inset(self, y):
+        """圆角矩形在第 y 行左右各内缩多少像素。"""
+        r, h = self._radius, self._ch
+        if y < r:
+            dy = r - y
+        elif y > h - r:
+            dy = y - (h - r)
+        else:
+            return 0.0
+        return r - max(0.0, r * r - dy * dy) ** 0.5
+
+    def _render(self):
+        self.delete("all")
+        w, h = self._cw, self._ch
+        top, bottom, htop, hbot, ptop, pbot, fg = self.PALETTE[self.kind]
+
+        if not self.enabled:
+            top, bottom, fg = "#f0f0f4", "#e8e8ee", "#b4b4bc"
+        elif self._state == "hover":
+            top, bottom = htop, hbot
+        elif self._state == "press":
+            top, bottom = ptop, pbot
+
+        # 逐行扫描线：一次画出圆角 + 垂直渐变（玻璃的立体感来源）
+        for y in range(h):
+            inset = self._row_inset(y)
+            self.create_line(inset, y + 0.5, w - inset, y + 0.5,
+                             fill=mix_color(top, bottom, y / max(1, h - 1)))
+
+        # 顶部高光 + 底部收边：玻璃质感的两个关键细节
+        self.create_line(self._radius * 0.6, 1.0, w - self._radius * 0.6, 1.0,
+                         fill=mix_color(top, "#ffffff", 0.55))
+        self.create_line(self._radius * 0.6, h - 1.5, w - self._radius * 0.6, h - 1.5,
+                         fill=mix_color(bottom, "#000000", 0.10))
+
+        self.create_text(w / 2, h / 2, text=self.text, fill=fg, font=self._font)
 
 
 # ============================ aria2 引擎封装 ============================
@@ -266,27 +455,7 @@ class Aria2Engine:
             raise FileNotFoundError(f"未找到 aria2 引擎：{ARIA2_EXE}")
 
         self.port = free_port()          # 每次启动换空闲端口，避免被残留实例占死
-        args = [
-            ARIA2_EXE,
-            "--enable-rpc",
-            f"--rpc-listen-port={self.port}",
-            f"--rpc-secret={self.secret}",
-            "--rpc-listen-all=false",
-            "--no-proxy=localhost,127.0.0.1",
-            "--continue=true",
-            # none：不预分配。prealloc 会在下载开始前先把整个文件大小的空间写满，
-            # 几十 GB 的包会把磁盘瞬间打满并卡住系统，务必保持 none。
-            "--file-allocation=none",
-            "--disk-cache=128M",     # 内存写盘缓存，减少磁盘写次数
-            "--max-tries=0",
-            "--retry-wait=20",
-            "--timeout=60",
-            "--connect-timeout=20",
-            "--auto-file-renaming=false",
-            "--allow-overwrite=false",
-            "--summary-interval=0",
-            "--quiet=true",
-        ]
+        args = build_engine_args(self.port, self.secret)
         self.proc = subprocess.Popen(
             args,
             creationflags=CREATE_NO_WINDOW,
@@ -336,8 +505,15 @@ class Aria2Engine:
             raise RuntimeError(data["error"].get("message", "RPC 调用失败"))
         return data.get("result")
 
-    def add_uri(self, url, options):
-        return self.rpc("aria2.addUri", [[url], options])
+    def add_uri(self, uris, options):
+        """uris 可以是单个地址，也可以是同一文件的多个镜像地址。
+
+        传多个时 aria2 会把不同分段分给不同节点并行拉取 —— 两个节点的限速是各自独立的，
+        总带宽可以叠加（注意：分段总数由 --split 决定，多源只是把同样的分段摊给两台服务器）。
+        """
+        if isinstance(uris, str):
+            uris = [uris]
+        return self.rpc("aria2.addUri", [uris, options])
 
     def tell_active(self):
         return self.rpc("aria2.tellActive")
@@ -473,6 +649,7 @@ class App:
         self.var_user = tk.StringVar()
         self.var_pass = tk.StringVar()
         self.var_save = tk.StringVar()
+        self.var_mirror = tk.StringVar()
         self.var_conn = tk.StringVar(value=DEFAULT_CONN)
         self.var_jobs = tk.StringVar(value=DEFAULT_JOBS)
         self.var_total = tk.StringVar(value="尚未开始")
@@ -521,19 +698,28 @@ class App:
         ttk.Entry(frame, textvariable=self.var_pass, show="*").grid(
             row=0, column=7, padx=(0, 10), pady=7, sticky="ew")
 
-        ttk.Button(frame, text="连接", style="Accent.TButton",
-                   command=self.do_connect).grid(row=0, column=8, padx=4, pady=7)
-        ttk.Button(frame, text="断开", command=self.do_disconnect).grid(
-            row=0, column=9, padx=(0, 10), pady=7)
+        GlassButton(frame, text="连接", kind="primary",
+                    command=self.do_connect).grid(row=0, column=8, padx=4, pady=7)
+        GlassButton(frame, text="断开",
+                    command=self.do_disconnect).grid(row=0, column=9, padx=(0, 10), pady=7)
 
         ttk.Label(frame, text="保存目录", foreground=TEXT_MUTED).grid(
-            row=1, column=0, padx=(10, 4), pady=(0, 9), sticky="e")
+            row=1, column=0, padx=(10, 4), pady=(0, 7), sticky="e")
         ttk.Entry(frame, textvariable=self.var_save).grid(
-            row=1, column=1, columnspan=6, padx=(0, 10), pady=(0, 9), sticky="ew")
-        ttk.Button(frame, text="浏览…", command=self.choose_save_dir).grid(
-            row=1, column=7, padx=(0, 4), pady=(0, 9), sticky="w")
-        ttk.Button(frame, text="打开目录", command=self.open_save_dir).grid(
-            row=1, column=8, padx=4, pady=(0, 9))
+            row=1, column=1, columnspan=6, padx=(0, 10), pady=(0, 7), sticky="ew")
+        GlassButton(frame, text="浏览…", command=self.choose_save_dir,
+                    padx=16).grid(row=1, column=7, padx=(0, 4), pady=(0, 7), sticky="w")
+        GlassButton(frame, text="打开目录", command=self.open_save_dir,
+                    padx=16).grid(row=1, column=8, padx=4, pady=(0, 7))
+
+        # 同一份数据在另一个节点上的镜像：aria2 会并行从两个源拉不同分段来提速
+        ttk.Label(frame, text="镜像主机", foreground=TEXT_MUTED).grid(
+            row=2, column=0, padx=(10, 4), pady=(0, 10), sticky="e")
+        ttk.Entry(frame, textvariable=self.var_mirror).grid(
+            row=2, column=1, columnspan=3, padx=(0, 10), pady=(0, 10), sticky="ew")
+        ttk.Label(frame, text="可选。填同一份数据的另一个 FTP 节点，两个源并行拉取会更快（如 ftp2 配 ftp3）",
+                  foreground=TEXT_MUTED).grid(
+            row=2, column=4, columnspan=6, padx=(0, 10), pady=(0, 10), sticky="w")
 
     def _build_middle_area(self):
         mid = ttk.Frame(self.content, style="Bg.TFrame")
@@ -550,9 +736,9 @@ class App:
 
         bar = ttk.Frame(left)
         bar.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
-        ttk.Button(bar, text="← 上级", command=self.go_parent).pack(side="left")
-        ttk.Button(bar, text="刷新",
-                   command=lambda: self.refresh_remote(force=True)).pack(side="left", padx=6)
+        GlassButton(bar, text="← 上级", command=self.go_parent, padx=14).pack(side="left")
+        GlassButton(bar, text="刷新", padx=14,
+                    command=lambda: self.refresh_remote(force=True)).pack(side="left", padx=6)
         ttk.Label(bar, textvariable=self.var_path, foreground=TEXT_MUTED,
                   font=FONT_MONO).pack(side="left", padx=6)
 
@@ -574,8 +760,8 @@ class App:
         sb1.grid(row=1, column=1, sticky="ns", padx=(0, 8), pady=(0, 6))
         self.tree_remote.configure(yscrollcommand=sb1.set)
 
-        ttk.Button(left, text="把勾选的文件加入下载队列", style="Accent.TButton",
-                   command=self.add_checked).grid(
+        GlassButton(left, text="把勾选的文件加入下载队列", kind="primary",
+                    command=self.add_checked).grid(
             row=2, column=0, sticky="w", padx=(8, 0), pady=(0, 10))
 
         # ---- 右：下载队列 ----
@@ -611,9 +797,12 @@ class App:
 
         qbar = ttk.Frame(right)
         qbar.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 10))
-        ttk.Button(qbar, text="暂停 / 继续", command=self.toggle_pause).pack(side="left")
-        ttk.Button(qbar, text="移除选中", command=self.remove_selected).pack(side="left", padx=6)
-        ttk.Button(qbar, text="清除已完成", command=self.clear_finished).pack(side="left")
+        GlassButton(qbar, text="暂停 / 继续", command=self.toggle_pause,
+                    padx=16).pack(side="left")
+        GlassButton(qbar, text="移除选中", command=self.remove_selected,
+                    padx=16).pack(side="left", padx=6)
+        GlassButton(qbar, text="清除已完成", command=self.clear_finished,
+                    padx=16).pack(side="left")
 
     def _build_status_area(self):
         frame = ttk.Frame(self.content, style="Bg.TFrame")
@@ -632,7 +821,8 @@ class App:
         ttk.Label(settings, text="同时下载文件数", style="Bg.TLabel").pack(side="left")
         ttk.Spinbox(settings, from_=1, to=10, width=4,
                     textvariable=self.var_jobs).pack(side="left", padx=(6, 12))
-        ttk.Button(settings, text="应用", command=self.apply_settings).pack(side="left")
+        GlassButton(settings, text="应用", command=self.apply_settings,
+                    padx=16, bg=BG).pack(side="left")
 
         ttk.Label(top, textvariable=self.var_total, background=BG, foreground=TEXT).grid(
             row=0, column=1, sticky="e", padx=8)
@@ -901,36 +1091,24 @@ class App:
 
         host = self.var_host.get().strip()
         port = self.var_port.get().strip()
-        conn = self.var_conn.get().strip() or DEFAULT_CONN
+        conn = str(clamp_int(self.var_conn.get(), 1, MAX_CONN, DEFAULT_CONN))
         user = self.var_user.get().strip()
         pwd = self.var_pass.get()
 
-        base_opts = {
-            "dir": save_dir,
-            "split": conn,
-            "max-connection-per-server": conn,
-            "min-split-size": "4M",
-            "continue": "true",
-            # 不预分配：prealloc 会先把整个文件大小的空间写满，几十 GB 的包会瞬间打满磁盘
-            "file-allocation": "none",
-            "max-tries": "0",
-            "retry-wait": "20",
-            "timeout": "60",
-            "connect-timeout": "20",
-            "auto-file-renaming": "false",
-            "allow-overwrite": "false",
-        }
-        if user:
-            base_opts["ftp-user"] = user
-            base_opts["ftp-passwd"] = pwd
+        base_opts = build_download_options(save_dir, conn, user, pwd)
 
+        mirror = self.var_mirror.get().strip()
         added = 0
         for remote, name in list(self.checked.items()):
-            url = f"ftp://{host}:{port}{urllib.parse.quote(remote)}"
+            path = urllib.parse.quote(remote)
+            uris = [f"ftp://{host}:{port}{path}"]
+            if mirror:
+                # 同一文件的第二个源：两节点限速独立，总带宽可叠加
+                uris.append(f"ftp://{mirror}:{port}{path}")
             opts = dict(base_opts)
             opts["out"] = name
             try:
-                gid = self.engine.add_uri(url, opts)
+                gid = self.engine.add_uri(uris, opts)
                 self.gid_names[gid] = name
                 self.queue_order.append(gid)
                 self.tree_queue.insert("", "end", iid=gid,
@@ -941,7 +1119,7 @@ class App:
 
         self.checked.clear()
         self._clear_checks()
-        jobs = self.var_jobs.get().strip() or "1"
+        jobs = str(clamp_int(self.var_jobs.get(), 1, MAX_JOBS, DEFAULT_JOBS))
         self.log(f"已加入队列：{added} 个文件（引擎同时下载 {jobs} 个，其余排队中）")
         self.apply_settings(quiet=True)
 
@@ -1079,7 +1257,7 @@ class App:
     # ---------------------------- 设置 / 杂项 ----------------------------
 
     def apply_settings(self, quiet=False):
-        jobs = self.var_jobs.get().strip() or "1"
+        jobs = str(clamp_int(self.var_jobs.get(), 1, MAX_JOBS, DEFAULT_JOBS))
         try:
             self.engine.change_global({"max-concurrent-downloads": jobs})
             if not quiet or self.last_jobs != jobs:
@@ -1116,6 +1294,7 @@ class App:
         self.var_port.set(cfg.get("port", DEFAULT_PORT))
         self.var_user.set(cfg.get("user", ""))
         self.var_save.set(cfg.get("save_dir", os.path.join(os.path.expanduser("~"), "Downloads")))
+        self.var_mirror.set(cfg.get("mirror", ""))
         self.var_conn.set(cfg.get("conn", DEFAULT_CONN))
         self.var_jobs.set(cfg.get("jobs", DEFAULT_JOBS))
 
@@ -1125,6 +1304,7 @@ class App:
             "port": self.var_port.get(),
             "user": self.var_user.get(),
             "save_dir": self.var_save.get(),
+            "mirror": self.var_mirror.get(),
             "conn": self.var_conn.get(),
             "jobs": self.var_jobs.get(),
         }
