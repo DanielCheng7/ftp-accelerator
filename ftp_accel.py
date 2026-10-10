@@ -33,7 +33,7 @@ from tkinter import ttk, filedialog, messagebox
 # ================================ 常量配置 ================================
 
 APP_NAME = "FTP 加速下载器"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 
 RPC_TIMEOUT = 10          # 单次 RPC 调用超时（秒）
 
@@ -45,6 +45,33 @@ MAX_CONN = 16                      # aria2 的 max-connection-per-server 硬上�
 MAX_JOBS = 10                      # 同时下载文件数上限
 
 POLL_MS = 1000            # 队列刷新间隔（毫秒）
+
+# ---- 出错自动重试 / 自动重连 ----
+# 为什么需要（2026-10-10 实测，见 apps/ftp-download/_test/probe_error_recovery.py）：
+#   aria2 自带的 --max-tries=0 只覆盖"传输中途掉线"那类可重试错误；
+#   一旦服务器回 "421/530 Too many connections" 这类 FTP 状态码，aria2 会在 0.5 秒内
+#   把任务判成 errorCode=21 并**彻底放弃重试**。科研数据站（如 TPDC）按"单 IP 连接数"
+#   限额，我们自己开的 8 条连接就能把额度占满，于是频繁撞上这一条 —— 以前只能人工重连。
+AUTORETRY_DEFAULT = True
+MAX_RETRY_DEFAULT = "20"  # 每个文件最多自动重试几次（界面可调，1–999）
+
+RETRY_BASE_WAIT = 5       # 首次重试前等待（秒）
+RETRY_MAX_WAIT = 60       # 退避上限（秒）
+MAX_ENGINE_RESTARTS = 20  # 单次会话里引擎最多自动重启几次（再不行就是杀软/环境问题了）
+
+# 「再试也没用」的错误码（aria2 手册 EXIT STATUS）：
+#   3 找不到文件 / 9 磁盘空间不足 / 24 鉴权失败 / 29 参数非法 /
+#   10–18 全是本地文件系统问题 —— 重试只会刷屏，直接判死刑让用户去处理
+RETRY_FATAL_CODES = {3, 4, 9, 10, 12, 13, 14, 15, 16, 17, 18, 20, 24, 25, 26, 27, 28, 29}
+
+# "连接数被限额"类提示：除了等，还要把「每文件连接数」降档
+# （多半是我们自己把每 IP 的额度占满了，硬顶着重试只会一直撞墙）
+CONN_LIMIT_HINTS = ("421", "too many", "maximum number of clients",
+                    "connection limit", "try again later")
+# "账号/密码不对"类提示：这不是网络抖动，重试没意义
+AUTH_FATAL_HINTS = ("login incorrect", "not logged in", "user cannot log in",
+                    "authentication failed", "530 login", "530 user",
+                    "username or password", "access denied")
 
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "FTPAccelerator")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
@@ -156,6 +183,28 @@ def clamp_int(text, lo, hi, default):
     except (TypeError, ValueError):
         value = int(default)
     return max(lo, min(hi, value))
+
+
+def retry_wait(attempt):
+    """第 attempt 次重试前等待几秒：5 → 10 → 20 → 40 → 60（封顶）。"""
+    return min(RETRY_MAX_WAIT, RETRY_BASE_WAIT * (2 ** max(0, attempt - 1)))
+
+
+def classify_error(error_code, message):
+    """判断一个 aria2 错误值不值得自动重试。
+
+    返回 (是否可重试, 原因短语)。
+    aria2 报的 errorMessage 往往只有 `status=530` 这种干巴巴的状态码（实测如此），
+    所以这里不敢按"文字像不像鉴权失败"来判 530 —— 留给 _probe_control_login()
+    用我们自己的 ftplib（能拿到完整应答）去分辨。这里只按错误码判死刑。
+    """
+    try:
+        code = int(error_code or 0)
+    except (TypeError, ValueError):
+        code = 0
+    if code in RETRY_FATAL_CODES:
+        return False, "aria2 错误码 %d（重试不会有变化）" % code
+    return True, ""
 
 
 def build_download_options(save_dir, conn, user="", pwd=""):
@@ -569,6 +618,12 @@ class App:
         self.last_status = {}             # {gid: 最近一次状态}
         self.refreshing = False           # 列目录重入保护
         self.poll_errors = 0              # 队列刷新异常计数
+        self.tasks = {}                   # {任务键: 重试档案} 任务键 = 保存目录 + 文件名
+        self.gid_keys = {}                # {gid: 任务键}
+        self.engine_retry_at = 0.0        # 下次允许尝试重启引擎的时刻
+        self.engine_restarts = 0          # 引擎自动重启次数
+        self.engine_gave_up = False       # 重启次数用尽后置位，避免反复刷日志
+        self.conn_params = ("", "", "", "")   # 主线程抄下的 (host, port, user, pwd) 快照
         self.last_jobs = None             # 上次应用的并发数
         self.ui_queue = queue.Queue()     # 后台线程 -> 主线程 的 UI 操作队列
         self.maximized = False            # 窗口是否已最大化
@@ -652,6 +707,8 @@ class App:
         self.var_mirror = tk.StringVar()
         self.var_conn = tk.StringVar(value=DEFAULT_CONN)
         self.var_jobs = tk.StringVar(value=DEFAULT_JOBS)
+        self.var_autoretry = tk.BooleanVar(value=AUTORETRY_DEFAULT)
+        self.var_maxretry = tk.StringVar(value=MAX_RETRY_DEFAULT)
         self.var_total = tk.StringVar(value="尚未开始")
         self.var_path = tk.StringVar(value="/")
 
@@ -801,6 +858,8 @@ class App:
                     padx=16).pack(side="left")
         GlassButton(qbar, text="移除选中", command=self.remove_selected,
                     padx=16).pack(side="left", padx=6)
+        GlassButton(qbar, text="重试选中", command=self.manual_retry_selected,
+                    padx=16).pack(side="left", padx=6)
         GlassButton(qbar, text="清除已完成", command=self.clear_finished,
                     padx=16).pack(side="left")
 
@@ -821,6 +880,13 @@ class App:
         ttk.Label(settings, text="同时下载文件数", style="Bg.TLabel").pack(side="left")
         ttk.Spinbox(settings, from_=1, to=10, width=4,
                     textvariable=self.var_jobs).pack(side="left", padx=(6, 12))
+        tk.Checkbutton(settings, text="自动重试", variable=self.var_autoretry,
+                       bg=BG, fg=TEXT, activebackground=BG, activeforeground=TEXT,
+                       selectcolor=SURFACE, font=FONT_UI, highlightthickness=0,
+                       bd=0, cursor="hand2").pack(side="left", padx=(0, 4))
+        ttk.Spinbox(settings, from_=1, to=999, width=4,
+                    textvariable=self.var_maxretry).pack(side="left")
+        ttk.Label(settings, text="次", style="Bg.TLabel").pack(side="left", padx=(4, 12))
         GlassButton(settings, text="应用", command=self.apply_settings,
                     padx=16, bg=BG).pack(side="left")
 
@@ -894,6 +960,7 @@ class App:
             messagebox.showwarning("提示", "请填写主机地址")
             return
         self.log(f"正在连接 {host}:{port or '21'} …")
+        self.snapshot_conn()          # 抄一份给后台线程（探针/自动重连）用
         threading.Thread(target=self._connect_worker, args=(host, port, user, pwd),
                          daemon=True).start()
 
@@ -931,7 +998,12 @@ class App:
     # ---------------------------- 远程浏览 ----------------------------
 
     def refresh_remote(self, force=False):
-        """列目录放后台线程 —— FTP 往返慢时不能冻住界面。"""
+        """列目录放后台线程 —— FTP 往返慢时不能冻住界面。
+
+        顺手在这里（主线程）刷新连接参数快照：后台的自动重连只认快照，
+        而「列目录」正是主机/账号必须为最新的时刻。
+        """
+        self.snapshot_conn()
         if self.ftp is None:
             if force:
                 self.log("尚未连接，无法列目录")
@@ -981,10 +1053,27 @@ class App:
         entries.sort(key=lambda e: (not e[1], e[0].lower()))
         return entries
 
-    def _reconnect(self):
-        """重建 FTP 控制连接（空闲被服务器断开、或连接被占满时用）。"""
-        host = self.var_host.get().strip()
-        port = self.var_port.get().strip()
+    def snapshot_conn(self):
+        """在**主线程**把连接参数抄一份存起来，供后台线程使用。
+
+        ⚠️ 后台线程绝不能直接读 tkinter 变量 —— 实测会抛
+        `RuntimeError: main thread is not in main loop`（tkinter 变量只能在解释器所在
+        的线程访问；mainloop 没在跑时连"排队执行"的机会都没有）。原来的 _reconnect()
+        就在后台线程里读 var_host / var_user，只是运气好没暴露问题。
+        """
+        self.conn_params = (self.var_host.get().strip(), self.var_port.get().strip(),
+                            self.var_user.get().strip(), self.var_pass.get())
+        return self.conn_params
+
+    def _reconnect(self, params=None):
+        """重建 FTP 控制连接（空闲被服务器断开、或连接被占满时用）。
+
+        params = (host, port, user, pwd)。不传就用主线程抄下快照 —— 绝不碰 tkinter 变量。
+        """
+        host, port, user, pwd = params or self.conn_params
+        if params is None and threading.current_thread() is threading.main_thread():
+            # 主线程调用时以界面上的为准（后台线程才退而求其次用快照）
+            host, port, user, pwd = self.snapshot_conn()
         with self.ftp_lock:
             if self.ftp is not None:
                 try:
@@ -995,7 +1084,7 @@ class App:
             ftp = ftplib.FTP()
             ftp.encoding = "utf-8"
             ftp.connect(host, int(port or 21), timeout=25)
-            ftp.login(self.var_user.get().strip(), self.var_pass.get())
+            ftp.login(user, pwd)
             self.ftp = ftp
         self.log(f"已重新连接 {host}:{port}")
 
@@ -1109,10 +1198,9 @@ class App:
             opts["out"] = name
             try:
                 gid = self.engine.add_uri(uris, opts)
-                self.gid_names[gid] = name
-                self.queue_order.append(gid)
-                self.tree_queue.insert("", "end", iid=gid,
-                                       values=(name, "-", "0%", "-", "-", "排队中"))
+                self._register_task(gid, name, uris, opts,
+                                    conn=clamp_int(conn, 1, MAX_CONN, DEFAULT_CONN),
+                                    save_dir=save_dir, user=user, pwd=pwd)
                 added += 1
             except Exception as exc:
                 self.log(f"加入失败 {name}：{exc}")
@@ -1154,6 +1242,7 @@ class App:
                 self.tree_queue.delete(gid)
             except Exception:
                 pass
+            self._forget_task(gid)
             self.gid_names.pop(gid, None)
             self.last_status.pop(gid, None)
             if gid in self.queue_order:
@@ -1167,6 +1256,7 @@ class App:
                 self.engine.remove(gid)
                 if self.tree_queue.exists(gid):
                     self.tree_queue.delete(gid)
+                self._forget_task(gid)
                 self.gid_names.pop(gid, None)
                 self.last_status.pop(gid, None)
                 if gid in self.queue_order:
@@ -1178,6 +1268,11 @@ class App:
         """定时从 aria2 拉取任务状态并刷新界面。"""
         try:
             if self.engine.proc is None or self.engine.proc.poll() is not None:
+                # 引擎死了：自动重启并把断点接上（有任务在身、且距上次尝试超过 10 秒才动手）
+                if (self._auto_retry_enabled() and any(not t["done"] for t in self.tasks.values())
+                        and time.time() >= self.engine_retry_at):
+                    self.engine_retry_at = time.time() + 10
+                    self._ensure_engine()
                 self.root.after(POLL_MS, self._poll)
                 return
 
@@ -1206,7 +1301,9 @@ class App:
                     "complete": "完成", "removed": "已移除",
                 }.get(status, status)
                 if status == "error":
-                    text = f"出错 {t.get('errorCode', '')}"
+                    text = self._retry_label(gid, t, f"出错 {t.get('errorCode', '')}")
+                elif status == "complete":
+                    self._mark_task_done(gid)
                 tag = {
                     "active": "active", "complete": "done",
                     "error": "error", "paused": "paused",
@@ -1229,6 +1326,9 @@ class App:
                 sum_done += done
                 if status in ("complete", "error", "removed"):
                     finished += 1
+
+            # 出错的任务交给自动重试兜底（重新入队后 gid 会变，下一轮刷新就接上了）
+            self._handle_error_tasks(tasks)
 
             stat = self.engine.get_global_stat()
             speed_total = int(stat.get("downloadSpeed", 0) or 0)
@@ -1253,6 +1353,281 @@ class App:
             if self.poll_errors <= 3:
                 self.log(f"刷新队列出错（第 {self.poll_errors} 次）：{exc!r}")
         self.root.after(POLL_MS, self._poll)
+
+    # ---------------------- 出错自动重试 / 自动重连 ----------------------
+
+    @staticmethod
+    def _task_key(save_dir, name):
+        """任务的身份 = 保存目录 + 文件名。重试会换 gid，但身份不能变。"""
+        return os.path.normcase(os.path.join(save_dir, name))
+
+    def _register_task(self, gid, name, uris, opts, conn, save_dir, user, pwd):
+        """记下"再来一次"所需的全部信息 —— 自动重试和引擎重启都靠它。"""
+        key = self._task_key(save_dir, name)
+        task = self.tasks.get(key)
+        if task is None:
+            task = {"name": name, "uris": uris, "opts": opts, "conn": int(conn),
+                    "save_dir": save_dir, "user": user, "pwd": pwd, "gid": gid,
+                    "attempts": 0, "next_at": 0.0, "gave_up": False,
+                    "done": False, "probed": False}
+            self.tasks[key] = task
+        else:
+            task.update({"uris": uris, "opts": opts, "conn": int(conn), "gid": gid,
+                         "attempts": 0, "next_at": 0.0, "gave_up": False,
+                         "done": False, "probed": False})
+        self.gid_keys[gid] = key
+        self.gid_names[gid] = name
+        if gid not in self.queue_order:
+            self.queue_order.append(gid)
+        if not self.tree_queue.exists(gid):
+            self.tree_queue.insert("", "end", iid=gid,
+                                   values=(name, "-", "0%", "-", "-", "排队中"))
+        return task
+
+    def _task_opts(self, task, conn=None):
+        """按任务原参数生成选项；给了 conn 就覆盖连接数（降档重试用）。"""
+        opts = build_download_options(task["save_dir"], conn or task["conn"],
+                                      task["user"], task["pwd"])
+        opts["out"] = task["name"]
+        return opts
+
+    def _auto_retry_enabled(self):
+        return bool(self.var_autoretry.get())
+
+    def _max_retry(self):
+        return clamp_int(self.var_maxretry.get(), 1, 999, int(MAX_RETRY_DEFAULT))
+
+    def _replace_row(self, old_gid, new_gid, name):
+        """重试会换 gid：把队列表格里那一行原样挪到新 gid 下，顺序不变。"""
+        if self.tree_queue.exists(new_gid):
+            return
+        try:
+            index = self.tree_queue.index(old_gid)
+        except Exception:
+            index = "end"
+        try:
+            self.tree_queue.delete(old_gid)
+        except Exception:
+            pass
+        self.tree_queue.insert("", index, iid=new_gid,
+                               values=(name, "-", "0%", "-", "-", "排队中"))
+
+    def _rebind_gid(self, old_gid, new_gid, key, name):
+        """把 gid → 任务 的映射整体挪到新 gid 上（表格行 + 各本字典）。"""
+        self._replace_row(old_gid, new_gid, name)
+        self.gid_names[new_gid] = name
+        self.gid_names.pop(old_gid, None)
+        self.gid_keys.pop(old_gid, None)
+        self.gid_keys[new_gid] = key
+        self.last_status.pop(old_gid, None)
+        if old_gid in self.queue_order:
+            self.queue_order[self.queue_order.index(old_gid)] = new_gid
+
+    def _forget_task(self, gid):
+        """任务从队列里消失时同步注销它的重试档案。
+
+        用户主动「移除选中」= 明确不想再要它了，所以标 done，免得被自动重试拉回来。
+        """
+        key = self.gid_keys.pop(gid, None)
+        if key is None:
+            return
+        task = self.tasks.get(key)
+        if task is not None:
+            task["done"] = True
+
+    def _mark_task_done(self, gid):
+        """任务真的下完了：注销重试档案，避免引擎重启时把它又拉起来。"""
+        task = self.tasks.get(self.gid_keys.get(gid))
+        if task is None or task["done"]:
+            return
+        task["done"] = True
+        if task["attempts"]:
+            # 计数刻意不清零：它是"重试过几次才下完"的凭据（日志 + 队列行都能看到）
+            self.log(f"「{task['name']}」自动重试后已下载完成（共重试 {task['attempts']} 次）")
+
+    def _retry_label(self, gid, t, fallback):
+        """error 行的状态文案：把自动重试的进度 / 放弃原因直接写在状态列上。"""
+        task = self.tasks.get(self.gid_keys.get(gid))
+        if task is None or task["done"] or not self._auto_retry_enabled():
+            return fallback
+        code = t.get("errorCode", "")
+        if task["gave_up"]:
+            return f"需人工({code})"
+        limit = self._max_retry()
+        if task["attempts"] >= limit:
+            return f"重试超限({code})"
+        left = int(max(0.0, task["next_at"] - time.time()))
+        return f"自动重试 {task['attempts']}/{limit}" + (f"·{left}s" if left else "")
+
+    def _ensure_engine(self):
+        """引擎挂了就换端口重启，并把没下完的任务重新入队（断点续传）。
+
+        这条对应"断电重连"：aria2c 进程被系统/杀软干掉时，以前界面会一直停在旧状态
+        不动、必须人工重开程序；现在自动重启并把断点接上。
+        """
+        if self.engine.proc is not None and self.engine.proc.poll() is None:
+            return False
+        if self.engine_restarts >= MAX_ENGINE_RESTARTS:
+            if not self.engine_gave_up:
+                self.engine_gave_up = True
+                self.log(f"引擎已自动重启 {MAX_ENGINE_RESTARTS} 次仍不稳定，停止自动重启 —— "
+                         f"请检查 aria2c.exe 是否被安全软件拦截。")
+            return False
+        pending = [t for t in self.tasks.values() if not t["done"]]
+        self.log("检测到 aria2 引擎已退出，正在自动重启 …")
+        try:
+            self.engine.start()
+        except Exception as exc:
+            self.log(f"引擎自动重启失败：{exc}")
+            return False
+        self.engine_restarts += 1
+        for task in pending:
+            try:
+                key = self._task_key(task["save_dir"], task["name"])
+                saved_attempts = task["attempts"]   # _register_task 会把它清零，先存住
+                self._register_task(self.engine.add_uri(task["uris"], self._task_opts(task)),
+                                    task["name"], task["uris"], task["opts"],
+                                    task["conn"], task["save_dir"], task["user"], task["pwd"])
+                self.tasks[key]["attempts"] = saved_attempts
+                self.log(f"引擎重启后重新入队：{task['name']}（断点续传）")
+            except Exception as exc:
+                self.log(f"重新入队失败 {task['name']}：{exc}")
+        self.apply_settings(quiet=True)
+        return True
+
+    def _probe_control_login(self, task, params=None):
+        """后台探一次登录，分辨"密码不对"和"连接数满"。
+
+        aria2 报的 errorMessage 只有 `status=530`，看不出是哪种 530；
+        我们自己的 ftplib 能拿到完整应答文本（"530 Login incorrect" /
+        "530 Sorry, the maximum number of clients…"），正好补上这个信息。
+        """
+        key = self._task_key(task["save_dir"], task["name"])
+
+        def worker():
+            try:
+                # 用主线程取好的快照：后台线程读 tkinter 变量会抛 RuntimeError
+                self._reconnect(params)
+            except Exception as exc:
+                msg = str(exc)
+                if any(h in msg.lower() for h in AUTH_FATAL_HINTS):
+                    cur = self.tasks.get(key)
+                    if cur is not None:
+                        cur["gave_up"] = True
+                    self.post(lambda: self.log(
+                        f"服务器拒绝了登录（{msg}）—— 这不是网络抖动，已停止「{task['name']}」"
+                        f"的自动重试，请核对账号密码。"))
+                else:
+                    self.post(lambda: self.log(
+                        f"控制连接也连不上（{msg}），继续退避重试「{task['name']}」"))
+            else:
+                self.post(lambda: self.log(
+                    f"控制连接正常 —— 判定为服务器数据连接被限额，继续自动重试「{task['name']}」"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_error_tasks(self, tasks):
+        """对处于 error 的任务做自动重试决策。返回本次实际重新入队的任务数。
+
+        重试姿势：先 removeDownloadResult 清掉历史记录（否则 addUri 会命中那个已停止的
+        任务、什么都不做），再原样 addUri —— `continue=true` 会让 aria2 从断点续传。
+        """
+        if not self._auto_retry_enabled():
+            return 0
+        retried = 0
+        now = time.time()
+        for gid, t in list(tasks.items()):
+            if t.get("status") != "error":
+                continue
+            key = self.gid_keys.get(gid)
+            task = self.tasks.get(key)
+            if task is None or task["gave_up"] or task["done"]:
+                continue
+
+            code = t.get("errorCode", "")
+            message = str(t.get("errorMessage", ""))
+            ok, why = classify_error(code, message)
+            if not ok:
+                task["gave_up"] = True
+                self.log(f"「{task['name']}」不再自动重试：{why}")
+                continue
+
+            limit = self._max_retry()
+            if task["attempts"] >= limit:
+                task["gave_up"] = True
+                self.log(f"「{task['name']}」已自动重试 {limit} 次仍未成功，转为人工处理。"
+                         f"可在队列里选中它点「重试选中」，或检查账号 / 服务器连接数上限。")
+                continue
+
+            if now < task["next_at"]:
+                continue                     # 还在退避窗口里，等下一轮
+
+            if not task["probed"]:
+                task["probed"] = True        # 只探一次，别把服务器问烦
+                # 快照必须在主线程现取：_load_config 时那份可能早就被用户改掉了，
+                # 而后台线程又不能自己读 tkinter 变量。这里显式传进去最稳妥。
+                self._probe_control_login(task, self.snapshot_conn())
+                if task["gave_up"]:
+                    continue
+
+            attempts = task["attempts"] + 1
+            # 连撞"连接数上限"多半是我们自己占满了每个 IP 的额度 -> 把连接数降档，
+            # 硬顶着重试只会一直撞墙（8 → 4 → 2 → 1）
+            conn = task["conn"]
+            if attempts >= 3 and (str(code) == "21"
+                                  or any(h in message.lower() for h in CONN_LIMIT_HINTS)):
+                conn = max(1, task["conn"] >> min(3, (attempts - 2) // 2 + 1))
+            uris = list(task["uris"])
+            mirrored = len(uris) > 1 and attempts % 2 == 0
+            if mirrored:
+                uris.reverse()               # 交替先试镜像节点：两个节点的限额各自独立
+
+            try:
+                self.engine.remove(gid)
+                new_gid = self.engine.add_uri(uris, self._task_opts(task, conn))
+            except Exception as exc:
+                task["next_at"] = now + retry_wait(attempts)
+                self.log(f"「{task['name']}」自动重试失败：{exc}")
+                continue
+
+            task.update({"attempts": attempts, "next_at": now + retry_wait(attempts),
+                         "gid": new_gid})
+            self._rebind_gid(gid, new_gid, key, task["name"])
+            extra = f"，连接数降到 {conn}" if conn != task["conn"] else ""
+            src = "镜像节点优先" if mirrored else "原节点"
+            self.log(f"「{task['name']}」出错自动重试 第 {attempts}/{limit} 次"
+                     f"（{src}{extra}，{retry_wait(attempts)} 秒后开始；断点续传）")
+            retried += 1
+        return retried
+
+    def manual_retry_selected(self):
+        """把选中的任务立刻重新入队（断点续传）并重置重试计数。
+
+        自动重试耗尽、或用户关掉了自动重试时，用它代替"重新勾选一遍文件"。
+        """
+        sel = self.tree_queue.selection()
+        if not sel:
+            self.log("先在队列里选中要重试的任务")
+            return
+        if self.engine.proc is None or self.engine.proc.poll() is not None:
+            if not self._ensure_engine():
+                return
+        for gid in sel:
+            key = self.gid_keys.get(gid)
+            task = self.tasks.get(key)
+            if task is None:
+                self.log("该任务不是本次会话加入的，无法重试（重新勾选文件即可）")
+                continue
+            try:
+                self.engine.remove(gid)
+                new_gid = self.engine.add_uri(task["uris"], self._task_opts(task))
+            except Exception as exc:
+                self.log(f"重试失败 {task['name']}：{exc}")
+                continue
+            task.update({"gid": new_gid, "attempts": 0, "gave_up": False,
+                         "done": False, "probed": False, "next_at": 0.0})
+            self._rebind_gid(gid, new_gid, key, task["name"])
+            self.log(f"手动重试：{task['name']}（断点续传）")
 
     # ---------------------------- 设置 / 杂项 ----------------------------
 
@@ -1297,6 +1672,9 @@ class App:
         self.var_mirror.set(cfg.get("mirror", ""))
         self.var_conn.set(cfg.get("conn", DEFAULT_CONN))
         self.var_jobs.set(cfg.get("jobs", DEFAULT_JOBS))
+        self.var_autoretry.set(bool(cfg.get("autoretry", AUTORETRY_DEFAULT)))
+        self.var_maxretry.set(str(cfg.get("max_retry", MAX_RETRY_DEFAULT)))
+        self.snapshot_conn()          # 后面所有后台线程都靠这份快照，别让它空着
 
     def _save_config(self):
         cfg = {
@@ -1307,6 +1685,8 @@ class App:
             "mirror": self.var_mirror.get(),
             "conn": self.var_conn.get(),
             "jobs": self.var_jobs.get(),
+            "autoretry": bool(self.var_autoretry.get()),
+            "max_retry": self.var_maxretry.get(),
         }
         try:
             os.makedirs(CONFIG_DIR, exist_ok=True)
