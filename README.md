@@ -160,8 +160,11 @@ _test/test_auto_retry.py      出错自动重试 / 自动重连的端到端验�
 _test/test_window_drag.py     窗口尺寸 / 圆点位置 / 拖动行为回归（含事件积压合并）
 _test/bench_drag.py           拖动性能基准（新旧实现对比，量每事件耗时与真实移动次数）
 _test/probe_drag_cost.py      探针：分解「Tk wm geometry」与「SetWindowPos」两种移动机制的开销
+_test/probe_launch_flash.py   探针：启动时窗口是否先闪一个错误尺寸再跳（去重统计所有矩形）
 _test/probe_error_recovery.py 探针：可注入故障的迷你 FTP（拒绝连接 / 掐断数据 / 限速）
+_test/measure_chrome.py       探针：量运行中窗口的非客户区（验证去标题栏无残留）
 _test/shoot_ui.py             起 exe 核验标题/非客户区，并重拍 README 截图
+_test/test_diagnose.py        跑连接数扫描用的驱动
 _test/diagnose_speed.py       连接数扫描（1/2/4/8/16），自动给结论
 dist/                         打包产物
 ```
@@ -175,6 +178,8 @@ E:\Python\python.exe _test\test_speed_opts.py      # 参数真的生效了吗
 E:\Python\python.exe _test\test_auto_retry.py      # 出错真的能自己缓过来吗（6 组，各起独立进程）
 E:\Python\python.exe _test\test_window_drag.py     # 窗口尺寸 / 圆点位置 / 拖动（21 项）
 E:\Python\python.exe _test\bench_drag.py           # 拖动性能基准（每事件耗时）
+E:\Python\python.exe _test\probe_launch_flash.py   # 启动有没有"先闪一个错误尺寸"
+E:\Python\python.exe _test\shoot_ui.py             # 起 exe 核验窗口 + 重拍 README 截图
 ```
 
 带界面的程序还有一条无界面自检，用于验证打包产物是否完整：
