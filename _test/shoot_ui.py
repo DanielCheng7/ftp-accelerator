@@ -13,9 +13,12 @@
 
 import os
 import sys
+import json
 import time
+import shutil
 import ctypes
 import ctypes.wintypes
+import tempfile
 import subprocess
 
 # 必须在任何 GUI/截图库之前声明「系统 DPI 感知」，否则坐标全是被虚拟化过的
@@ -34,9 +37,33 @@ OUT = os.path.join(APP_DIR, "screenshot.png")
 
 u = ctypes.windll.user32
 WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
-SWP_NOSIZE, SWP_NOZORDER = 0x0001, 0x0004
+SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE = 0x0001, 0x0004, 0x0010
 WM_CLOSE = 0x0010
 PW_RENDERFULLCONTENT = 0x00000002
+
+# ⚠️ README 是公开的，截图里绝不能出现用户的真实账号名。
+# 所以用一份**临时** APPDATA 启动 exe：既不动用户真实配置，也保证画面是干净的默认值。
+DEMO_CONFIG = {
+    "host": "ftp2.tpdc.ac.cn",
+    "port": "6201",
+    "user": "your_account",
+    "save_dir": "D:/Download",
+    "mirror": "ftp3.tpdc.ac.cn",
+    "conn": "8",
+    "jobs": "1",
+    "autoretry": True,
+    "max_retry": "20",
+}
+
+
+def make_demo_appdata():
+    """造一个临时 APPDATA，里面放好演示用的 config.json，返回路径。"""
+    base = tempfile.mkdtemp(prefix="ftp_shot_")
+    cfg_dir = os.path.join(base, "FTPAccelerator")
+    os.makedirs(cfg_dir, exist_ok=True)
+    with open(os.path.join(cfg_dir, "config.json"), "w", encoding="utf-8") as fh:
+        json.dump(DEMO_CONFIG, fh, ensure_ascii=False, indent=2)
+    return base
 
 
 def text_of(hwnd):
@@ -114,7 +141,8 @@ def main():
         print("找不到 exe：", EXE)
         return 1
     print(f"启动：{EXE}")
-    proc = subprocess.Popen([os.path.abspath(EXE)])
+    demo_appdata = make_demo_appdata()
+    proc = subprocess.Popen([os.path.abspath(EXE)], env=dict(os.environ, APPDATA=demo_appdata))
     ok = True
     try:
         hit = find_window()
@@ -123,12 +151,12 @@ def main():
             return 1
         hwnd, title = hit
         print(f"窗口标题：{title!r}")
-        if "v1.6.0" not in title:
-            print("!! 标题里没有 v1.6.0")
+        if "v1.7.0" not in title:
+            print("!! 标题里没有 v1.7.0")
             ok = False
 
-        u.SetWindowPos(hwnd, 0, 60, 60, 0, 0, SWP_NOSIZE | SWP_NOZORDER)
-        u.SetForegroundWindow(hwnd)
+        # 挪到左上角拍图；带 SWP_NOACTIVATE，别去抢用户当前窗口的焦点
+        u.SetWindowPos(hwnd, 0, 60, 60, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
         time.sleep(2.0)
 
         rect = ctypes.wintypes.RECT()
@@ -163,6 +191,7 @@ def main():
             proc.terminate()
         except Exception:
             pass
+        shutil.rmtree(demo_appdata, ignore_errors=True)
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

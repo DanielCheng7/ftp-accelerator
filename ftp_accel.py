@@ -20,10 +20,12 @@ import time
 import uuid
 import queue
 import socket
+import ctypes
 import ftplib
 import tempfile
 import threading
 import subprocess
+import ctypes.wintypes
 import urllib.parse
 import urllib.request
 import tkinter as tk
@@ -33,7 +35,7 @@ from tkinter import ttk, filedialog, messagebox
 # ================================ 常量配置 ================================
 
 APP_NAME = "FTP 加速下载器"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 
 RPC_TIMEOUT = 10          # 单次 RPC 调用超时（秒）
 
@@ -106,6 +108,10 @@ DOT_CLOSE = "#FF5F57"     # 红：关闭
 DOT_MIN = "#FEBC2E"       # 黄：最小化
 DOT_MAX = "#28C840"       # 绿：最大化 / 还原
 TITLEBAR_H = 38           # 标题栏高度
+
+# ---- 窗口尺寸（物理像素；本机屏 2560x1600，1600x1000 约占 63%）----
+WIN_W, WIN_H = 1600, 1000
+WIN_MIN_W, WIN_MIN_H = 1100, 720
 
 
 def resource_path(rel):
@@ -363,22 +369,83 @@ def strip_window_chrome(root):
     表现就是「第一次拖动窗口时顶部冒出一条多余的栏」。
     """
     if os.name != "nt":
-        return
-    import ctypes
+        return 0
 
     gwl_style = -16
     ws_caption = 0x00C00000
     swp_nosize, swp_nomove, swp_nozorder, swp_framechanged = 0x0001, 0x0002, 0x0004, 0x0020
 
-    root.update_idletasks()
-    hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
-    if not hwnd:
-        hwnd = root.winfo_id()
+    hwnd = win_hwnd(root)
     style = ctypes.windll.user32.GetWindowLongW(hwnd, gwl_style)
     ctypes.windll.user32.SetWindowLongW(hwnd, gwl_style, style & ~ws_caption)
     ctypes.windll.user32.SetWindowPos(
         hwnd, 0, 0, 0, 0, 0,
         swp_nosize | swp_nomove | swp_nozorder | swp_framechanged)
+    return hwnd
+
+
+# ============================ Win32 窗口几何 ============================
+# 全程物理像素。本进程在 enable_hidpi() 里已声明 DPI 感知（system aware），
+# 所以 GetWindowRect / GetCursorPos / SetWindowPos 三者单位一致，不需要任何比例换算。
+#
+# ⚠️ 拖动窗口绝不能用 root.geometry("+x+y")：
+#    实测每步合计 44.9 ms（发起调用只要 0.01 ms，代价全在随后的 update() 触发的重排重绘里），
+#    而直接 SetWindowPos 只要 0.6 ms —— 差 70 倍。
+#    鼠标按 125Hz 回报、8 ms 一个事件，44.9 ms 处理一个必然积压，窗口就"跟不上手"。
+
+SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE = 0x0001, 0x0004, 0x0010
+
+
+def win_hwnd(root):
+    """取顶层窗口句柄。Tk 的 winfo_id() 给的是内层窗口，要问它的父窗口。"""
+    if os.name != "nt":
+        return 0
+    root.update_idletasks()
+    hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+    return hwnd or root.winfo_id()
+
+
+def win_rect(hwnd):
+    """窗口矩形 -> (x, y, w, h)。每次现读，绝不用任何缓存值。"""
+    rect = ctypes.wintypes.RECT()
+    if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+
+
+def cursor_pos():
+    """当前光标位置 -> (x, y)。"""
+    pt = ctypes.wintypes.POINT()
+    if not ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+        return None
+    return pt.x, pt.y
+
+
+def move_window(hwnd, x, y):
+    """只改位置：不改尺寸、不改 Z 序、不激活。"""
+    if not hwnd:
+        return False
+    return bool(ctypes.windll.user32.SetWindowPos(
+        hwnd, 0, int(x), int(y), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE))
+
+
+def is_zoomed(hwnd):
+    """问系统"这个窗口是不是最大化"。
+
+    ⚠️ 不能只信自己维护的标志位：一旦跟真实状态脱节，拖动就会「点了完全没反应」——
+    最大化的窗口 Windows 会忽略移动请求。
+    """
+    if not hwnd:
+        return False
+    return bool(ctypes.windll.user32.IsZoomed(hwnd))
+
+
+def restore_window(hwnd, x, y, w, h):
+    """把窗口摆回指定外框矩形（位置与尺寸一起给）。"""
+    if not hwnd:
+        return False
+    return bool(ctypes.windll.user32.SetWindowPos(
+        hwnd, 0, int(x), int(y), int(w), int(h), SWP_NOZORDER | SWP_NOACTIVATE))
 
 
 def mix_color(c1, c2, t):
@@ -603,8 +670,7 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title(f"{APP_NAME}  v{APP_VERSION}")
-        self.root.geometry("1300x800")
-        self.root.minsize(1040, 680)
+        self.root.minsize(WIN_MIN_W, WIN_MIN_H)
 
         self.engine = Aria2Engine(self.log)
 
@@ -627,12 +693,26 @@ class App:
         self.last_jobs = None             # 上次应用的并发数
         self.ui_queue = queue.Queue()     # 后台线程 -> 主线程 的 UI 操作队列
         self.maximized = False            # 窗口是否已最大化
-        self.restore_geom = ""            # 还原用的几何串
+        self._saved_rect = None           # 最大化之前的外框矩形（物理像素）
+        self._hwnd = 0                    # 顶层窗口句柄（拖动/最大化都走 Win32）
+        self._drag = None                 # 拖动会话：{rect, cur, last, queued}
+
+        # 先藏起来：`strip_window_chrome` 里会 update_idletasks()，那时窗口会以 Tk 自己算的
+        # 尺寸先映射出来，随后才被改尺寸/居中 —— 用户会看到窗口"跳一下"（实测 3 个不同矩形）。
+        # 等尺寸和位置都摆好再 deiconify，全程只出现一个矩形。
+        self.root.withdraw()
 
         self._build_ui()
-        strip_window_chrome(self.root)    # 摘掉原生标题栏，换成自绘的
+        # ⚠️ 顺序要紧：**先摘原生标题栏、再设尺寸**。摘掉标题栏会让客户区长高一个标题栏的高度
+        # （本机 150% 缩放 = 36px）；反过来先设尺寸，实际客户区就会比要的大这么多（实测）。
+        self._hwnd = strip_window_chrome(self.root)
+        self.root.geometry(f"{WIN_W}x{WIN_H}")
+        self.root.update_idletasks()
+        self._center_window()
         self._load_config()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.deiconify()
+        self.root.update_idletasks()
 
         try:
             self.engine.start()
@@ -647,25 +727,28 @@ class App:
     # ---------------------------- 界面构建 ----------------------------
 
     def _build_titlebar(self):
-        """仿 Mac 的标题栏：左侧三个圆点、中间标题，整条可拖动。"""
+        """仿 Mac 的标题栏：中间标题、三个圆点在右，整条可拖动。"""
         bar = tk.Frame(self.root, bg=TITLEBAR_BG, height=TITLEBAR_H)
         bar.grid(row=0, column=0, sticky="ew")
         bar.grid_propagate(False)
+        self.titlebar = bar                     # 留给拖动与测试
 
+        title = tk.Label(bar, text=APP_NAME, bg=TITLEBAR_BG, fg=TEXT_MUTED, font=FONT_UI)
+        title.place(relx=0.5, rely=0.5, anchor="center")
+
+        # 三个圆点放在右边（仍按「关闭/最小化/最大化」自左至右排列）
         dots = tk.Canvas(bar, width=72, height=TITLEBAR_H, bg=TITLEBAR_BG,
                          highlightthickness=0, cursor="hand2")
-        dots.pack(side="left", padx=(14, 0))
+        dots.pack(side="right", padx=(0, 14))
         for i, color in enumerate((DOT_CLOSE, DOT_MIN, DOT_MAX)):
             x = 6 + i * 22
             dots.create_oval(x, 13, x + 13, 26, fill=color, outline="")
         dots.bind("<Button-1>", self._on_dot_click)
 
-        title = tk.Label(bar, text=APP_NAME, bg=TITLEBAR_BG, fg=TEXT_MUTED, font=FONT_UI)
-        title.place(relx=0.5, rely=0.5, anchor="center")
-
         for widget in (bar, title):
             widget.bind("<Button-1>", self._start_drag)
             widget.bind("<B1-Motion>", self._on_drag)
+            widget.bind("<ButtonRelease-1>", self._end_drag)
         bar.bind("<Double-Button-1>", lambda e: self._toggle_maximize())
 
     def _on_dot_click(self, event):
@@ -676,27 +759,93 @@ class App:
         else:
             self._toggle_maximize()
 
+    # ---------------------------- 窗口拖动 ----------------------------
+    # 全程走 Win32、全程物理像素。位置与光标都**现读**，所以"先拖过再拖""缩放过再拖"
+    # 这类不一致从根上没有了；落位用 SetWindowPos 而不是 root.geometry()（见模块顶部的实测）。
+
     def _start_drag(self, event):
-        self._drag_dx = event.x_root - self.root.winfo_x()
-        self._drag_dy = event.y_root - self.root.winfo_y()
+        """按下：记下「窗口矩形 + 光标位置」，之后按光标位移平移窗口。"""
+        if not self._hwnd:
+            return
+        # 最大化状态下拖 = 先还原（与系统标题栏行为一致）。
+        # ⚠️ 必须问系统 is_zoomed —— 最大化的窗口 Windows 会忽略移动请求，只看标志位会「拖了不动」。
+        if self.maximized or is_zoomed(self._hwnd):
+            self._restore_from_max()
+            self.root.update_idletasks()
+        rect = win_rect(self._hwnd)
+        cur = cursor_pos()
+        if rect is None or cur is None:
+            self._drag = None
+            return
+        self._drag = {"rect": rect, "cur": cur, "last": (rect[0], rect[1]), "queued": False}
 
     def _on_drag(self, event):
-        x = event.x_root - self._drag_dx
-        y = event.y_root - self._drag_dy
-        self.root.geometry(f"+{x}+{y}")
+        """移动：只登记「该重算了」，真正落位合并成一次。
+
+        鼠标 125Hz 时事件远快于处理速度；每个事件都去搬一次窗口就会积压。
+        这里把一批事件合并成一次 SetWindowPos，且读的是**当时**的光标位置，不落后。
+        """
+        if not self._drag or self._drag["queued"]:
+            return
+        self._drag["queued"] = True
+        self.root.after(0, self._apply_drag)
+
+    def _apply_drag(self):
+        d = self._drag
+        if not d:
+            return
+        d["queued"] = False
+        cur = cursor_pos()
+        if cur is None:
+            return
+        x = d["rect"][0] + (cur[0] - d["cur"][0])
+        y = d["rect"][1] + (cur[1] - d["cur"][1])
+        if (x, y) == d["last"]:                 # 光标没动就别白调一次
+            return
+        d["last"] = (x, y)
+        move_window(self._hwnd, x, y)
+
+    def _end_drag(self, event):
+        self._drag = None
 
     def _minimize(self):
         self.root.iconify()
 
+    def _center_window(self):
+        """按**外框**尺寸把窗口摆到主屏正中。
+
+        ⚠️ 别用 root.geometry("WxH+x+y") 居中：那里的 W/H 是**客户区**、x/y 却是**外框**
+        左上角，两套坐标系混用会偏掉一个边框宽（实测偏 11px）。这里统一走 Win32。
+        """
+        rect = win_rect(self._hwnd)
+        if not rect:
+            return
+        screen_w = ctypes.windll.user32.GetSystemMetrics(0)
+        screen_h = ctypes.windll.user32.GetSystemMetrics(1)
+        _, _, w, h = rect
+        move_window(self._hwnd, max(0, (screen_w - w) // 2), max(0, (screen_h - h) // 2))
+
+    def _restore_from_max(self):
+        """还原成最大化之前的外框矩形。
+
+        ⚠️ 保存与还原都走 Win32 的**外框**矩形。早先用 `root.geometry()` 的几何串存，
+        而它的 W/H 是客户区 —— 拿外框尺寸喂进去，每还原一次就长大一圈（实测 1666x1096）。
+        """
+        self.root.state("normal")
+        self.root.update_idletasks()
+        if self._saved_rect:
+            restore_window(self._hwnd, *self._saved_rect)
+        self.maximized = False
+
     def _toggle_maximize(self):
-        if self.maximized:
-            self.root.state("normal")
-            if self.restore_geom:
-                self.root.geometry(self.restore_geom)
+        if self.maximized or is_zoomed(self._hwnd):
+            self._restore_from_max()
         else:
-            self.restore_geom = self.root.geometry()
+            # ⚠️ 必须问系统 is_zoomed，只看标志位会脱节（最大化的窗口系统会忽略移动请求，
+            # 症状就是「拖了完全不动」）
+            self._saved_rect = win_rect(self._hwnd)
             self.root.state("zoomed")
-        self.maximized = not self.maximized
+            self.maximized = True
 
     def _build_ui(self):
         self.var_host = tk.StringVar(value=DEFAULT_HOST)
